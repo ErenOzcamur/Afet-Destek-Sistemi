@@ -1,0 +1,14 @@
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+logs/
+exports/
+.env
+.DS_Store
+.idea/
+.claude/
+cache/
+.venv/
+*.egg-info/
+temp/
+*.zip

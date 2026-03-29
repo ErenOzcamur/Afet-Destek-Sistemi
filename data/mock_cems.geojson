@@ -1,0 +1,82 @@
+{
+  "type": "FeatureCollection",
+  "name": "CEMS_MOCK_EMSR648",
+  "crs": {"type": "name", "properties": {"name": "EPSG:4326"}},
+  "features": [
+    {
+      "type": "Feature", "id": "MOCK_0001",
+      "geometry": {"type": "Polygon", "coordinates": [[[36.998, 37.743], [37.003, 37.743], [37.003, 37.748], [36.998, 37.748], [36.998, 37.743]]]},
+      "properties": {"damage_grade": "Destroyed", "obj_type": "building", "area_sqm": 3025}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0002",
+      "geometry": {"type": "Polygon", "coordinates": [[[37.008, 37.750], [37.013, 37.750], [37.013, 37.755], [37.008, 37.755], [37.008, 37.750]]]},
+      "properties": {"damage_grade": "Highly Damaged", "obj_type": "building", "area_sqm": 2500}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0003",
+      "geometry": {"type": "Polygon", "coordinates": [[[37.005, 37.758], [37.010, 37.758], [37.010, 37.762], [37.005, 37.762], [37.005, 37.758]]]},
+      "properties": {"damage_grade": "Moderately Damaged", "obj_type": "building", "area_sqm": 1800}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0004",
+      "geometry": {"type": "Polygon", "coordinates": [[[36.992, 37.760], [36.998, 37.760], [36.998, 37.765], [36.992, 37.765], [36.992, 37.760]]]},
+      "properties": {"damage_grade": "Destroyed", "obj_type": "building", "area_sqm": 4200}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0005",
+      "geometry": {"type": "Polygon", "coordinates": [[[37.015, 37.745], [37.020, 37.745], [37.020, 37.750], [37.015, 37.750], [37.015, 37.745]]]},
+      "properties": {"damage_grade": "Highly Damaged", "obj_type": "building", "area_sqm": 3300}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0006",
+      "geometry": {"type": "LineString", "coordinates": [[36.990, 37.752], [36.998, 37.752], [37.005, 37.755]]},
+      "properties": {"damage_grade": "Destroyed", "obj_type": "road", "area_sqm": 800}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0007",
+      "geometry": {"type": "LineString", "coordinates": [[37.010, 37.760], [37.018, 37.758]]},
+      "properties": {"damage_grade": "Highly Damaged", "obj_type": "road", "area_sqm": 600}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0008",
+      "geometry": {"type": "Polygon", "coordinates": [[[37.000, 37.770], [37.012, 37.770], [37.012, 37.778], [37.000, 37.778], [37.000, 37.770]]]},
+      "properties": {"damage_grade": "Moderately Damaged", "obj_type": "building", "area_sqm": 5200}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0009",
+      "geometry": {"type": "Polygon", "coordinates": [[[37.018, 37.765], [37.023, 37.765], [37.023, 37.770], [37.018, 37.770], [37.018, 37.765]]]},
+      "properties": {"damage_grade": "Negligible to slight damage", "obj_type": "building", "area_sqm": 1200}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0010",
+      "geometry": {"type": "Polygon", "coordinates": [[[36.985, 37.748], [36.992, 37.748], [36.992, 37.754], [36.985, 37.754], [36.985, 37.748]]]},
+      "properties": {"damage_grade": "Destroyed", "obj_type": "building", "area_sqm": 6100}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0011",
+      "geometry": {"type": "Polygon", "coordinates": [[[37.003, 37.740], [37.009, 37.740], [37.009, 37.745], [37.003, 37.745], [37.003, 37.740]]]},
+      "properties": {"damage_grade": "Highly Damaged", "obj_type": "building", "area_sqm": 2800}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0012",
+      "geometry": {"type": "LineString", "coordinates": [[37.005, 37.740], [37.005, 37.755], [37.005, 37.770]]},
+      "properties": {"damage_grade": "Highly Damaged", "obj_type": "road", "area_sqm": 900}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0013",
+      "geometry": {"type": "Polygon", "coordinates": [[[37.022, 37.752], [37.028, 37.752], [37.028, 37.757], [37.022, 37.757], [37.022, 37.752]]]},
+      "properties": {"damage_grade": "Moderately Damaged", "obj_type": "building", "area_sqm": 2100}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0014",
+      "geometry": {"type": "Polygon", "coordinates": [[[36.980, 37.762], [36.988, 37.762], [36.988, 37.768], [36.980, 37.768], [36.980, 37.762]]]},
+      "properties": {"damage_grade": "Destroyed", "obj_type": "building", "area_sqm": 7200}
+    },
+    {
+      "type": "Feature", "id": "MOCK_0015",
+      "geometry": {"type": "Polygon", "coordinates": [[[37.010, 37.775], [37.016, 37.775], [37.016, 37.780], [37.010, 37.780], [37.010, 37.775]]]},
+      "properties": {"damage_grade": "Highly Damaged", "obj_type": "building", "area_sqm": 3600}
+    }
+  ]
+}

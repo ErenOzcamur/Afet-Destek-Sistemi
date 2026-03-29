@@ -1,0 +1,6 @@
+[ui]
+hideTopBar = false
+
+[client]
+showSidebarNavigation = false
+toolbarMode = "viewer"
