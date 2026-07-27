@@ -11,7 +11,7 @@ streamlit-js-eval>=0.1.7
 # --- GIS & Mapping ---
 folium>=0.16.0
 streamlit-folium>=0.15.0
-leafmap>=0.30.0
+leafmap>=0.63.0
 
 # --- Computer Vision ---
 opencv-python-headless>=4.9.0
