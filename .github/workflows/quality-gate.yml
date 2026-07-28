@@ -1,0 +1,118 @@
+# =============================================================================
+# Ortak Kalite Kapısı (Quality Gate) — yeniden kullanılabilir workflow şablonu
+# Faz 4.1 · Tüm ErenOzcamur depolarına dağıtılacak ortak taban.
+#
+# KURULUM:
+#   1) Bu dosyayı her depoda  .github/workflows/quality-gate.yml  olarak koy.
+#   2) `lang:` matrisini deponun diline göre sadeleştir (kullanmadığın job'ı sil).
+#   3) gitleaks + SBOM job'ları dilden bağımsız, olduğu gibi kalsın.
+#
+# Kapsananlar: lint · test · kapsam · gitleaks (secret) · SBOM (bağımlılık)
+# =============================================================================
+name: quality-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Secret taraması — dilden bağımsız, HER depoda kalır.
+  #    (Private repolarda GHAS kilitli olduğu için gitleaks fallback'i.)
+  # ---------------------------------------------------------------------------
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+  # ---------------------------------------------------------------------------
+  # 2) SBOM üretimi — bağımlılık envanteri (supply-chain görünürlüğü).
+  # ---------------------------------------------------------------------------
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: SBOM (syft → SPDX)
+        uses: anchore/sbom-action@e11c554f704a0b820cbf8c51673f6945e0731532 # v0.20.0
+        with:
+          format: spdx-json
+          artifact-name: sbom.spdx.json
+
+  # ---------------------------------------------------------------------------
+  # 3) Lint + Test + Kapsam — DİLE GÖRE. Kullanmadığın job'ı sil.
+  # ---------------------------------------------------------------------------
+
+  node:
+    # fintech, sigorta-acenta, study-repeat (api), ai-feature-planner, projectforge
+    if: false   # <-- deponuz Node ise: true yap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run lint --if-present
+      - run: npm test --if-present
+      - run: npm run coverage --if-present   # eşik: %80 (proje bazlı ayarla)
+
+  python:
+    # insurance-ai-platform, sigorta-acenta (worker)
+    if: false   # <-- deponuz Python ise: true yap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213a0330a8b0b19bc9b898c8c3d # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]" || pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest --cov --cov-fail-under=80
+
+  swift:
+    # purevo, macos-perf-panel
+    if: false   # <-- deponuz Swift ise: true yap (runner: macos-15)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: swift build -v
+      - run: swift test -v
+
+  flutter:
+    # oyunbox, study-repeat (mobil)
+    if: false   # <-- deponuz Flutter ise: true yap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: subosito/flutter-action@e938fdf56512cc96ef2f93601a5a40bde3801046 # v2.19.0
+        with:
+          channel: stable
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test --coverage
+
+  rust:
+    # errorlog-yakalama, edgewatch (kısmi)
+    if: false   # <-- deponuz Rust ise: true yap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup component add clippy
+      - run: cargo clippy -- -D warnings
+      - run: cargo test
