@@ -23,9 +23,9 @@ Texture Analysis mantığı:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 from loguru import logger
@@ -70,12 +70,27 @@ HIGHWAY_WIDTH_EST: Dict[str, float] = {
     "unclassified": 3.0,
 }
 
+# Araç hızları (km/h)
+VEHICLE_SPEED_KMH: Dict[VehicleType, int] = {
+    VehicleType.AMBULANCE: 40,
+    VehicleType.FIRE_TRUCK: 35,
+    VehicleType.HEAVY_MACHINERY: 20,
+}
+DEFAULT_SPEED_KMH = 30
+
 # Araç rengi (harita görselleştirmesi)
 VEHICLE_COLOR: Dict[str, str] = {
     "Ambulans": "#e63946",
     "İtfaiye": "#f77f00",
     "İş Makinesi": "#6a4c93",
 }
+
+
+def _first_str(value, default: str) -> str:
+    """Liste ise ilk elemanı al, sonra str'e normalize et."""
+    if isinstance(value, list):
+        value = value[0] if value else None
+    return str(value or default)
 
 
 @dataclass
@@ -126,6 +141,30 @@ class MLRAEngine:
     TEXTURE_VAR_DEBRIS = 65.0   # Enkaz alt varyans sınırı
     PIXEL_BUFFER_M     = 1.5    # Yol kenarı buffer (metre)
 
+    # Rota ağırlık sabitleri
+    DEFAULT_EDGE_WEIGHT        = 100
+    DISALLOWED_HIGHWAY_PENALTY = 10
+    NARROW_ROAD_PENALTY        = 5
+    RESTRICTED_HEAVY_PENALTY   = 8
+    RESTRICTED_LIGHT_PENALTY   = 2
+    BLOCKED_EDGE_WEIGHT        = 9_999_999
+
+    # Örnekleme sabitleri
+    DAMAGE_MAX_SAMPLES      = 60
+    TEXTURE_MAX_SAMPLES     = 40
+    MIN_SAMPLES_PER_SEGMENT = 4
+
+    # Sınıflandırma eşikleri (varyans profili)
+    VAR_DEBRIS_MIN       = 70
+    VAR_FLOOD_MAX        = 15
+    VAR_COLLAPSE_MIN     = 100
+    VAR_VEHICLE_PILE_MIN = 40
+    VAR_VEHICLE_PILE_MAX = 80
+    DMG_HIGH             = 0.5
+    DMG_FLOOD_MIN        = 0.3
+    DMG_COLLAPSE_MIN     = 0.6
+    DMG_RESTRICTED_MIN   = 0.2
+
     def __init__(
         self,
         graph,                               # OSMnx MultiDiGraph
@@ -134,6 +173,14 @@ class MLRAEngine:
         geo_transform=None,                  # rasterio Affine transform
         resolution_m: float = 0.5,           # m/px — Planet SkySat varsayılanı
     ):
+        if not isinstance(binary_mask, np.ndarray):
+            raise ValueError(
+                f"binary_mask np.ndarray olmalı, alınan: {type(binary_mask).__name__}"
+            )
+        if binary_mask.ndim < 2:
+            raise ValueError(
+                f"binary_mask en az 2 boyutlu olmalı, alınan ndim={binary_mask.ndim}"
+            )
         self.graph = graph
         self.binary_mask = (binary_mask > 0).astype(np.uint8)
         self.gray_image = gray_image
@@ -144,6 +191,13 @@ class MLRAEngine:
         self._bbox: Optional[Tuple] = None
         # buffer piksel cinsinden
         self._buf_px = max(2, int(self.PIXEL_BUFFER_M / resolution_m))
+        # Disk offset'lerini bir kez ön-hesapla (vektörel örnekleme için)
+        offs = np.arange(-self._buf_px, self._buf_px + 1)
+        dy_grid, dx_grid = np.meshgrid(offs, offs, indexing="ij")
+        in_disk = (dy_grid ** 2 + dx_grid ** 2) <= self._buf_px ** 2
+        self._disk_dy = dy_grid[in_disk].ravel()
+        self._disk_dx = dx_grid[in_disk].ravel()
+        self._geo_warned = False
         logger.info(
             f"MLRAEngine: {resolution_m}m/px, "
             f"maske={self._h}×{self._w}, buffer={self._buf_px}px"
@@ -177,21 +231,16 @@ class MLRAEngine:
         try:
             bounds = edges_gdf.total_bounds  # (minx, miny, maxx, maxy)
             self._bbox = (bounds[1], bounds[3], bounds[0], bounds[2])
-        except Exception:
+        except (ValueError, AttributeError) as exc:
+            logger.warning(f"Bbox hesaplanamadı: {exc}")
             self._bbox = None
 
+        n_fail = 0
         for idx, row in edges_gdf.iterrows():
             try:
                 edge_key = f"{idx[0]}_{idx[1]}_{idx[2]}"
-                highway   = row.get("highway", "unclassified")
-                if isinstance(highway, list):
-                    highway = highway[0]
-                highway = str(highway)
-
-                name = row.get("name", "İsimsiz Yol")
-                if isinstance(name, list):
-                    name = name[0]
-                name = str(name or "İsimsiz Yol")
+                highway  = _first_str(row.get("highway", "unclassified"), "unclassified")
+                name     = _first_str(row.get("name", "İsimsiz Yol"), "İsimsiz Yol")
 
                 est_width = HIGHWAY_WIDTH_EST.get(highway, 3.0)
 
@@ -227,7 +276,11 @@ class MLRAEngine:
                     centroid_latlon=(cen_lat, cen_lon),
                 )
             except Exception as exc:
+                n_fail += 1
                 logger.debug(f"Segment {idx} analiz hatası: {exc}")
+
+        if n_fail:
+            logger.warning(f"{n_fail} segment analiz edilemedi")
 
         n_open = sum(1 for s in self._segments.values()
                      if s.obstruction_level == ObstructionLevel.OPEN)
@@ -264,48 +317,57 @@ class MLRAEngine:
             constraints  = VEHICLE_CONSTRAINTS[vehicle_type]
             allowed_hway = set(constraints["can_use"])
             min_width    = constraints["min_width_m"]
-            G            = self.graph.copy()
+            G            = self.graph
 
+            # Grafiği kopyalamadan kenar başına ağırlıkları hesapla (immutable)
+            weights: Dict[Tuple, float] = {}
             for u, v, k, data in G.edges(keys=True, data=True):
-                hw = data.get("highway", "unclassified")
-                if isinstance(hw, list):
-                    hw = hw[0]
-                hw = str(hw)
+                hw = _first_str(data.get("highway", "unclassified"), "unclassified")
 
                 edge_key = f"{u}_{v}_{k}"
                 seg      = self._segments.get(edge_key)
-                base_w   = data.get("travel_time", data.get("length", 100))
+                base_w   = data.get(
+                    "travel_time", data.get("length", self.DEFAULT_EDGE_WEIGHT)
+                )
 
                 # Yol tipi kısıtı
                 if hw not in allowed_hway:
-                    base_w *= 10
+                    base_w *= self.DISALLOWED_HIGHWAY_PENALTY
 
                 # Genişlik kısıtı
                 if HIGHWAY_WIDTH_EST.get(hw, 3.0) < min_width:
-                    base_w *= 5
+                    base_w *= self.NARROW_ROAD_PENALTY
 
                 # Hasar ağırlığı
                 if seg:
                     if seg.obstruction_level == ObstructionLevel.HIGH_OBSTRUCTION:
-                        base_w = 9_999_999
+                        base_w = self.BLOCKED_EDGE_WEIGHT
                     elif seg.obstruction_level == ObstructionLevel.RESTRICTED:
                         if vehicle_type in (VehicleType.FIRE_TRUCK,
                                             VehicleType.HEAVY_MACHINERY):
-                            base_w *= 8
+                            base_w *= self.RESTRICTED_HEAVY_PENALTY
                         else:
-                            base_w *= 2
+                            base_w *= self.RESTRICTED_LIGHT_PENALTY
 
-                G[u][v][k]["mlra_w"] = base_w
+                weights[(u, v, k)] = base_w
+
+            def _edge_weight(u, v, d) -> float:
+                # MultiDiGraph: d = {key: edge_data}; en ucuz paralel kenarı seç
+                return min(
+                    weights.get((u, v, kk), float("inf")) for kk in d
+                )
 
             orig_node = ox.nearest_nodes(G, X=origin[1], Y=origin[0])
             dest_node = ox.nearest_nodes(G, X=dest[1],   Y=dest[0])
-            path      = nx.dijkstra_path(G, orig_node, dest_node, weight="mlra_w")
+            path      = nx.dijkstra_path(G, orig_node, dest_node, weight=_edge_weight)
 
             coords, blocked, total_dist = [], [], 0.0
             for i in range(len(path) - 1):
                 u, v = path[i], path[i + 1]
                 ed   = G[u][v]
-                k    = min(ed, key=lambda k: ed[k].get("mlra_w", 0))
+                k    = min(
+                    ed, key=lambda kk: weights.get((u, v, kk), float("inf"))
+                )
                 d    = ed[k]
                 geom = d.get("geometry")
                 if geom:
@@ -320,22 +382,32 @@ class MLRAEngine:
                 if sg and sg.obstruction_level != ObstructionLevel.OPEN:
                     blocked.append(sg.street_name)
 
-            speed_kmh   = {"Ambulans": 40, "İtfaiye": 35, "İş Makinesi": 20}.get(
-                vehicle_type.value, 30
-            )
+            speed_kmh   = VEHICLE_SPEED_KMH.get(vehicle_type, DEFAULT_SPEED_KMH)
             travel_time = (total_dist / 1000) / speed_kmh * 3600
 
             return {
                 "coords":          coords,
                 "distance_m":      total_dist,
                 "travel_time_s":   travel_time,
-                "blocked_streets": list(set(blocked)),
+                "blocked_streets": list(dict.fromkeys(blocked)),
                 "vehicle":         vehicle_type.value,
                 "color":           VEHICLE_COLOR.get(vehicle_type.value, "#0077b6"),
             }
 
+        except nx.NetworkXNoPath as exc:
+            logger.warning(f"Taktik rota bulunamadı ({vehicle_type.value}): {exc}")
+            return None
+        except (ImportError, KeyError) as exc:
+            logger.error(
+                f"Taktik rota hatası ({vehicle_type.value}): "
+                f"{type(exc).__name__}: {exc}", exc_info=True
+            )
+            return None
         except Exception as exc:
-            logger.error(f"Taktik rota hatası ({vehicle_type.value}): {exc}")
+            logger.error(
+                f"Taktik rota hatası ({vehicle_type.value}): "
+                f"{type(exc).__name__}: {exc}", exc_info=True
+            )
             return None
 
     def get_visual_data(self) -> Dict:

@@ -27,12 +27,33 @@ from loguru import logger
 
 from config import app_config, cv_config
 
+try:
+    import rasterio
+    from rasterio.transform import rowcol, xy
+    _HAS_RASTERIO = True
+except ImportError:
+    rasterio = None
+    rowcol = None
+    xy = None
+    _HAS_RASTERIO = False
+
+# Preprocessing sabitleri
+NLM_H = 10
+NLM_H_COLOR = 10
+NLM_TEMPLATE_WINDOW = 7
+NLM_SEARCH_WINDOW = 21
+CLAHE_CLIP_LIMIT = 2.0
+CLAHE_TILE_GRID_SIZE = (8, 8)
+ORB_MAX_FEATURES = 5000
+MIN_MATCH_COUNT = 10
+RANSAC_REPROJ_THRESHOLD = 5.0
+
 
 # ────────────────────────────────────────────────────────────
 # 1. LOGLAMA
 # ────────────────────────────────────────────────────────────
 
-def setup_logger(log_dir: str = None) -> None:
+def setup_logger(log_dir: Optional[str] = None) -> None:
     """Loguru tabanlı merkezi loglama başlatır."""
     log_dir = log_dir or app_config.log_dir
     os.makedirs(log_dir, exist_ok=True)
@@ -75,11 +96,14 @@ class GeoImageReader:
 
     @staticmethod
     def _read_geotiff(filepath: Path) -> Dict:
+        if not _HAS_RASTERIO:
+            logger.warning("rasterio yok, standart okuma ile devam.")
+            return GeoImageReader._read_standard(filepath)
+
         try:
-            import rasterio
             with rasterio.open(filepath) as src:
                 if src.count >= 3:
-                    image = np.dstack([src.read(i) for i in range(1, 4)])
+                    image = np.transpose(src.read([1, 2, 3]), (1, 2, 0))
                 else:
                     image = src.read(1)
                 meta = {
@@ -91,11 +115,11 @@ class GeoImageReader:
                     "count": src.count,
                     "dtype": str(src.dtypes[0]),
                 }
-            logger.info(f"GeoTIFF yüklendi: {filepath.name} | CRS={meta['crs']}")
-            return {"image": image, "meta": meta}
-        except ImportError:
-            logger.warning("rasterio yok, standart okuma ile devam.")
-            return GeoImageReader._read_standard(filepath)
+        except rasterio.errors.RasterioIOError as e:
+            logger.error(f"GeoTIFF okunamadı: {e}")
+            raise
+        logger.info(f"GeoTIFF yüklendi: {filepath.name} | CRS={meta['crs']}")
+        return {"image": image, "meta": meta}
 
     @staticmethod
     def _read_standard(filepath: Path) -> Dict:
@@ -158,16 +182,19 @@ class PreprocessingPipeline:
     def _denoise(self, img):
         if len(img.shape) == 3 and img.shape[2] == 3:
             try:
-                return cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
-            except cv2.error:
-                pass
+                return cv2.fastNlMeansDenoisingColored(
+                    img, None, NLM_H, NLM_H_COLOR,
+                    NLM_TEMPLATE_WINDOW, NLM_SEARCH_WINDOW,
+                )
+            except cv2.error as e:
+                logger.warning(f"NlMeans denoise başarısız, GaussianBlur fallback: {e}")
         return cv2.GaussianBlur(img, self.cfg.blur_kernel_size, 0)
 
     def _equalize(self, img):
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID_SIZE)
         if len(img.shape) == 3:
-            lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
-            lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+            l_channel, a, b = cv2.split(cv2.cvtColor(img, cv2.COLOR_RGB2LAB))
+            lab = cv2.merge([clahe.apply(l_channel), a, b])
             return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
         return clahe.apply(img)
 
@@ -177,7 +204,7 @@ class PreprocessingPipeline:
         ref_g = cv2.cvtColor(ref, cv2.COLOR_RGB2GRAY) if len(ref.shape) == 3 else ref
         tgt_g = cv2.cvtColor(tgt, cv2.COLOR_RGB2GRAY) if len(tgt.shape) == 3 else tgt
 
-        orb = cv2.ORB_create(5000)
+        orb = cv2.ORB_create(ORB_MAX_FEATURES)
         kp1, d1 = orb.detectAndCompute(ref_g, None)
         kp2, d2 = orb.detectAndCompute(tgt_g, None)
         if d1 is None or d2 is None:
@@ -188,14 +215,15 @@ class PreprocessingPipeline:
             cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True).match(d1, d2),
             key=lambda m: m.distance,
         )
-        if len(matches) < 10:
-            logger.warning(f"Yetersiz eşleşme ({len(matches)}), atlanıyor.")
+        if len(matches) < MIN_MATCH_COUNT:
+            logger.warning(f"Yetersiz eşleşme ({len(matches)} < {MIN_MATCH_COUNT}), atlanıyor.")
             return tgt
 
         src = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
         dst = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-        M, _ = cv2.findHomography(dst, src, cv2.RANSAC, 5.0)
+        M, _ = cv2.findHomography(dst, src, cv2.RANSAC, RANSAC_REPROJ_THRESHOLD)
         if M is None:
+            logger.warning("Homography bulunamadı, hizalama atlanıyor.")
             return tgt
         return cv2.warpPerspective(tgt, M, (ref.shape[1], ref.shape[0]))
 
@@ -204,25 +232,29 @@ class PreprocessingPipeline:
 # 4. GIS YARDIMCILARI
 # ────────────────────────────────────────────────────────────
 
-def pixel_to_geo(px_x: float, px_y: float, transform) -> Tuple[float, float]:
+def pixel_to_geo(px_x: float, px_y: float, transform) -> Optional[Tuple[float, float]]:
     """Piksel koordinatını (lat, lon)'a dönüştürür."""
-    if transform is None:
+    if transform is None or not _HAS_RASTERIO:
+        if not _HAS_RASTERIO:
+            logger.warning("pixel_to_geo başarısız: rasterio kurulu değil.")
         return None
     try:
-        from rasterio.transform import xy
         geo_x, geo_y = xy(transform, int(px_y), int(px_x))
         return (geo_y, geo_x)  # (lat, lon)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"pixel_to_geo başarısız: {e}")
         return None
 
 
 def geo_to_pixel(lat: float, lon: float, transform) -> Optional[Tuple[int, int]]:
     """Geo koordinatı piksel konumuna dönüştürür."""
-    if transform is None:
+    if transform is None or not _HAS_RASTERIO:
+        if not _HAS_RASTERIO:
+            logger.warning("geo_to_pixel başarısız: rasterio kurulu değil.")
         return None
     try:
-        from rasterio.transform import rowcol
         row, col = rowcol(transform, lon, lat)
         return (col, row)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"geo_to_pixel başarısız: {e}")
         return None

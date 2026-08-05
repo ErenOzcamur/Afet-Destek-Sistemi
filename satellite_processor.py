@@ -27,12 +27,29 @@ analyzer.py entegrasyonu:
 from __future__ import annotations
 
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Generator, Optional, Tuple
 
 import numpy as np
 from loguru import logger
+
+# ── Sabitler ─────────────────────────────────────────────────
+
+METERS_PER_DEGREE = 111_320.0   # ekvatorda 1 derecenin yaklaşık metre karşılığı
+UINT8_MAX         = 255
+SSIM_DIFF_SCALE   = 127.5       # (1 - ssim_diff) → uint8 ölçekleme çarpanı
+MORPH_KERNEL_SIZE = (3, 3)
+MIN_SSIM_WIN      = 3
+
+
+def _require_rasterio():
+    """rasterio'yu import eder; yoksa açık mesajla ImportError fırlatır."""
+    try:
+        import rasterio
+        return rasterio
+    except ImportError as exc:
+        raise ImportError("rasterio gereklidir: pip install rasterio") from exc
 
 
 # ── Dataclass'lar ────────────────────────────────────────────
@@ -117,10 +134,7 @@ class SatelliteProcessor:
         Returns:
             ProcessingResult (transform, crs, damage_polygons, ...)
         """
-        try:
-            import rasterio
-        except ImportError as exc:
-            raise ImportError("rasterio gereklidir: pip install rasterio") from exc
+        rasterio = _require_rasterio()
 
         with rasterio.open(self.before_path) as src_b, \
              rasterio.open(self.after_path)  as src_a:
@@ -143,17 +157,21 @@ class SatelliteProcessor:
                 f"CRS: {crs} | Tile: {self.block_size}px"
             )
 
-            tile_count   = 0
-            damage_tiles = 0
-            total_dmg    = 0.0
-            total_px     = 0
+            from rasterio.windows import Window
+
+            tile_count    = 0
+            damage_tiles  = 0
+            skipped_tiles = 0
+            total_dmg     = 0.0
+            total_px      = 0
 
             with rasterio.open(output_path, "w", **profile) as dst:
-                for window, tile_transform in self._tile_windows(
+                # tile_transform kasıtlı olarak kullanılmıyor (bkz. _tile_windows)
+                for window, _tile_tf in self._tile_windows(
                     width, height, transform
                 ):
                     try:
-                        # Tile'ları oku — uint8 olarak (float64 yerine ~8× daha az RAM)
+                        # float32 olarak oku (float64 yerine ~2x daha az RAM)
                         b_tile = src_b.read(band, window=window).astype(np.float32)
                         a_tile = src_a.read(band, window=window).astype(np.float32)
 
@@ -169,8 +187,14 @@ class SatelliteProcessor:
                             b_tile, a_tile
                         )
 
-                        # Çıktıya yaz — CRS/transform otomatik korunur
-                        dst.write(mask[np.newaxis, :, :], window=window)
+                        # Çıktıya yaz — CRS/transform otomatik korunur.
+                        # Kırpılmış tile'larda yazma window'u maske boyutuna göre
+                        # yeniden oluşturulur (boyut hatasını önler).
+                        write_window = Window(
+                            window.col_off, window.row_off,
+                            mask.shape[1], mask.shape[0],
+                        )
+                        dst.write(mask[np.newaxis, :, :], window=write_window)
 
                         total_dmg += dmg_ratio * mask.size
                         total_px  += mask.size
@@ -178,14 +202,16 @@ class SatelliteProcessor:
                         if dmg_ratio > self.damage_threshold:
                             damage_tiles += 1
 
-                    except Exception as exc:
-                        logger.debug(f"Tile ({window}) işlem hatası: {exc}")
+                    except (rasterio.errors.RasterioIOError, ValueError) as exc:
+                        logger.warning(f"Tile {window} atlandı: {exc}")
+                        skipped_tiles += 1
                         continue
 
             overall_ratio = total_dmg / total_px if total_px > 0 else 0.0
             logger.info(
                 f"Tile işleme tamamlandı: {tile_count} tile, "
-                f"{damage_tiles} hasarlı, oran={overall_ratio:.2%}"
+                f"{damage_tiles} hasarlı, {skipped_tiles} atlandı, "
+                f"oran={overall_ratio:.2%}"
             )
 
         # Vektörizasyon
@@ -221,7 +247,8 @@ class SatelliteProcessor:
         Args:
             mask_path   : Binary hasar maskesi GeoTIFF
             crs         : Koordinat referans sistemi
-            transform   : Affine transform
+            transform   : Affine transform (geriye uyumluluk için tutulur;
+                          fiilen dosyadaki src.transform kullanılır)
             min_area_m2 : Küçük parazitleri filtrele
 
         Returns:
@@ -237,18 +264,23 @@ class SatelliteProcessor:
                 mask_arr = src.read(1)
                 tf       = src.transform
 
-            shapes = list(rasterio.features.shapes(
-                mask_arr.astype(np.uint8),
-                mask=mask_arr > 0,
-                transform=tf,
-            ))
+            # uint8 garantisi — dtype zaten uygunsa kopya çıkarmaz
+            mask_arr = np.asarray(mask_arr, dtype=np.uint8)
 
-            if not shapes:
+            # Generator'ı list'e çevirmeden tek geçişte tüket (RAM tasarrufu)
+            geoms = [
+                shape(s)
+                for s, v in rasterio.features.shapes(
+                    mask_arr, mask=mask_arr > 0, transform=tf
+                )
+                if v > 0
+            ]
+
+            if not geoms:
                 logger.info("Hasar vektörü: sıfır polygon")
                 return gpd.GeoDataFrame(columns=["geometry","area_m2"], crs=crs)
 
-            geoms   = [shape(s) for s, v in shapes if v > 0]
-            areas   = [g.area for g in geoms]
+            areas = [g.area for g in geoms]
 
             gdf = gpd.GeoDataFrame(
                 {"geometry": geoms, "area_m2": areas},
@@ -265,8 +297,8 @@ class SatelliteProcessor:
         except ImportError as exc:
             logger.warning(f"Vektörizasyon için geopandas/shapely gerekli: {exc}")
             return None
-        except Exception as exc:
-            logger.error(f"Vektörizasyon hatası: {exc}")
+        except (rasterio.errors.RasterioIOError, ValueError) as exc:
+            logger.error(f"Vektörizasyon hatası ({mask_path}): {exc}")
             return None
 
     def intersect_with_roads(
@@ -286,6 +318,10 @@ class SatelliteProcessor:
         Returns:
             Kesişen yol segmentlerini içeren GeoDataFrame
         """
+        if road_gdf is None or road_gdf.empty:
+            logger.warning("Yol GDF boş/None — kesişim yapılamadı")
+            return None
+
         try:
             import geopandas as gpd
 
@@ -297,9 +333,10 @@ class SatelliteProcessor:
             if damage_gdf.crs != road_gdf.crs:
                 damage_gdf = damage_gdf.to_crs(road_gdf.crs)
 
-            # Yol buffer'ı
-            road_buffered = road_gdf.copy()
-            road_buffered["geometry"] = road_gdf.geometry.buffer(buffer_m / 111320)
+            # Yol buffer'ı — immutable desen: kopya üzerinde mutasyon yerine assign
+            road_buffered = road_gdf.assign(
+                geometry=road_gdf.geometry.buffer(buffer_m / METERS_PER_DEGREE)
+            )
 
             # Kesişim
             intersected = gpd.sjoin(
@@ -312,8 +349,15 @@ class SatelliteProcessor:
             )
             return intersected
 
-        except Exception as exc:
-            logger.error(f"Kesişim analizi hatası: {exc}")
+        except ImportError as exc:
+            logger.error(f"Kesişim analizi için geopandas gerekli: {exc}")
+            return None
+        except (ValueError, AttributeError, TypeError, KeyError) as exc:
+            logger.error(
+                f"Kesişim analizi hatası: {exc} | "
+                f"damage CRS={getattr(damage_gdf, 'crs', None)}, "
+                f"road CRS={getattr(road_gdf, 'crs', None)}"
+            )
             return None
 
     def memory_mapped_diff(
@@ -325,40 +369,50 @@ class SatelliteProcessor:
 
         np.memmap: RAM'e yüklemeden disk üzerinden array indexlemeye
         izin verir. float64 → float32 dönüşümü belleği %50 azaltır.
+        Görüntü tam array olarak RAM'e alınmaz; block-window ile
+        parça parça memmap'e kopyalanır.
+
+        Not: Geçici .npy dosyaları benzersiz adla oluşturulur ve
+        çağıranın temizlemesi gerekir.
 
         Returns:
             (before_mmap, after_mmap) — disk-backed numpy arrays
         """
-        try:
-            import rasterio
-            out = Path(output_dir)
+        rasterio = _require_rasterio()
 
-            b_mmap_path = str(out / "_mmap_before.npy")
-            a_mmap_path = str(out / "_mmap_after.npy")
+        out = Path(output_dir)
 
-            with rasterio.open(self.before_path) as src:
-                shape = (src.height, src.width)
-                b_arr = src.read(1).astype(np.float32)
+        def _to_memmap(src_path: Path, prefix: str) -> np.ndarray:
+            import os
 
-            with rasterio.open(self.after_path) as src:
-                a_arr = src.read(1).astype(np.float32)
-
-            # Memory-map'e yaz (float32: float64'ün yarı RAM'i)
-            b_mmap = np.memmap(b_mmap_path, dtype=np.float32, mode="w+", shape=shape)
-            a_mmap = np.memmap(a_mmap_path, dtype=np.float32, mode="w+", shape=shape)
-            b_mmap[:] = b_arr
-            a_mmap[:] = a_arr
-            b_mmap.flush()
-            a_mmap.flush()
-
-            logger.info(
-                f"Memory-map: {shape[0]}×{shape[1]}px, "
-                f"~{b_arr.nbytes / 1e6:.1f}MB (float32)"
+            fd, mmap_path = tempfile.mkstemp(
+                dir=str(out), prefix=prefix, suffix=".npy"
             )
-            return b_mmap, a_mmap
+            os.close(fd)
+            with rasterio.open(src_path) as src:
+                shape = (src.height, src.width)
+                mmap = np.memmap(
+                    mmap_path, dtype=np.float32, mode="w+", shape=shape
+                )
+                # Pencere pencere kopyala — tam array hiçbir anda RAM'de değil
+                for _, win in src.block_windows(1):
+                    rows = slice(
+                        int(win.row_off), int(win.row_off + win.height)
+                    )
+                    cols = slice(
+                        int(win.col_off), int(win.col_off + win.width)
+                    )
+                    mmap[rows, cols] = src.read(1, window=win).astype(np.float32)
+                mmap.flush()
+            logger.info(
+                f"Memory-map: {mmap_path} — {shape[0]}×{shape[1]}px, "
+                f"~{mmap.nbytes / 1e6:.1f}MB (float32)"
+            )
+            return mmap
 
-        except ImportError as exc:
-            raise ImportError("rasterio gereklidir") from exc
+        b_mmap = _to_memmap(self.before_path, "_mmap_before_")
+        a_mmap = _to_memmap(self.after_path, "_mmap_after_")
+        return b_mmap, a_mmap
 
     # ── İç Metodlar ─────────────────────────────────────────
 

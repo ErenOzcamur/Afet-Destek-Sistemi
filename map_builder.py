@@ -17,10 +17,43 @@ from typing import Dict, List, Optional, Tuple
 
 import folium
 import folium.plugins as folium_plugins
-import numpy as np
 from loguru import logger
 
 from config import map_config
+
+# Tile kaynaklari
+ESRI_WORLD_IMAGERY_TILES = (
+    "https://server.arcgisonline.com/ArcGIS/rest/services/"
+    "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+)
+
+# Marker boyutlandirma sabitleri
+MARKER_RADIUS_MIN = 5
+MARKER_RADIUS_MAX = 20
+AREA_TO_RADIUS_DIVISOR = 1000
+
+# Varsayilan karsilastirma zoom seviyesi
+DEFAULT_COMPARISON_ZOOM = 15
+
+# Turkce hasar seviyesi etiketleri
+SEVERITY_LABELS = {
+    "low": "Hafif Hasar",
+    "mid": "Orta Hasar",
+    "high": "Ağır Hasar",
+}
+
+# HeatMap sabitleri
+HEATMAP_MIN_OPACITY = 0.4
+HEATMAP_MAX_ZOOM = 18
+HEATMAP_RADIUS = 25
+HEATMAP_BLUR = 15
+HEATMAP_GRADIENT = {
+    0.2: "#ffffb2",
+    0.4: "#fecc5c",
+    0.6: "#fd8d3c",
+    0.8: "#f03b20",
+    1.0: "#bd0026",
+}
 
 
 class MapBuilder:
@@ -36,11 +69,11 @@ class MapBuilder:
 
     def __init__(
         self,
-        center: Tuple[float, float] = None,
-        zoom: int = None,
+        center: Optional[Tuple[float, float]] = None,
+        zoom: Optional[int] = None,
     ):
-        self.center = center or map_config.default_center
-        self.zoom = zoom or map_config.default_zoom
+        self.center = map_config.default_center if center is None else center
+        self.zoom = map_config.default_zoom if zoom is None else zoom
         self._layers = []
         self._markers = []
         self._routes = []
@@ -58,10 +91,7 @@ class MapBuilder:
 
         # Uydu katmanı (toggle)
         folium.TileLayer(
-            tiles=(
-                "https://server.arcgisonline.com/ArcGIS/rest/services/"
-                "World_Imagery/MapServer/tile/{z}/{y}/{x}"
-            ),
+            tiles=ESRI_WORLD_IMAGERY_TILES,
             attr="Esri",
             name="Uydu Görüntüsü",
             overlay=False,
@@ -105,16 +135,24 @@ class MapBuilder:
         Returns:
             self (chaining desteği)
         """
+        pixel_to_geo = None
+        if transform is not None:
+            try:
+                from rasterio.transform import xy as pixel_to_geo
+            except ImportError as exc:
+                logger.warning(f"rasterio import edilemedi, piksel→geo dönüşüm devre dışı: {exc}")
+
+        added_count = 0
         for region in regions:
             if region.geo_centroid:
                 lat, lon = region.geo_centroid
-            elif transform is not None:
+            elif pixel_to_geo is not None:
                 try:
-                    from rasterio.transform import xy
                     px_x, px_y = region.centroid
-                    geo_x, geo_y = xy(transform, int(px_y), int(px_x))
+                    geo_x, geo_y = pixel_to_geo(transform, int(px_y), int(px_x))
                     lat, lon = geo_y, geo_x
-                except Exception:
+                except (ValueError, TypeError, IndexError) as exc:
+                    logger.warning(f"Bölge koordinat dönüşümü başarısız, atlandı: {exc}")
                     continue
             else:
                 continue
@@ -127,8 +165,9 @@ class MapBuilder:
                 "area": region.area_px,
                 "score": region.severity_score,
             })
+            added_count += 1
 
-        logger.info(f"{len(self._markers)} hasar marker'ı eklendi.")
+        logger.info(f"{added_count} hasar marker'ı eklendi.")
         return self
 
     def add_route(
@@ -161,26 +200,24 @@ class MapBuilder:
 
     def _create_marker(self, data: Dict) -> folium.CircleMarker:
         """Hasar marker'ı oluşturur."""
-        severity_labels = {
-            "low": "Hafif Hasar",
-            "mid": "Orta Hasar",
-            "high": "Ağır Hasar",
-        }
         popup_html = (
-            f"<b>{severity_labels.get(data['severity'], 'Hasar')}</b><br>"
+            f"<b>{SEVERITY_LABELS.get(data['severity'], 'Hasar')}</b><br>"
             f"Skor: {data['score']:.2f}<br>"
             f"Alan: {data['area']:.0f} px²"
         )
 
         return folium.CircleMarker(
             location=data["location"],
-            radius=max(5, min(20, data["area"] / 1000)),
+            radius=max(
+                MARKER_RADIUS_MIN,
+                min(MARKER_RADIUS_MAX, data["area"] / AREA_TO_RADIUS_DIVISOR),
+            ),
             color=data["color"],
             fill=True,
             fill_color=data["color"],
             fill_opacity=0.7,
             popup=folium.Popup(popup_html, max_width=200),
-            tooltip=severity_labels.get(data["severity"], ""),
+            tooltip=SEVERITY_LABELS.get(data["severity"], ""),
         )
 
     def _draw_route(self, data: Dict) -> folium.FeatureGroup:
@@ -226,9 +263,9 @@ class MapBuilder:
     @staticmethod
     def create_split_map(
         center: Tuple[float, float],
-        zoom: int = 15,
-        left_tile: str = None,
-        right_tile: str = None,
+        zoom: int = DEFAULT_COMPARISON_ZOOM,
+        left_tile: Optional[str] = None,
+        right_tile: Optional[str] = None,
         left_label: str = "Afet Öncesi",
         right_label: str = "Afet Sonrası",
     ) -> folium.plugins.DualMap:
@@ -252,10 +289,7 @@ class MapBuilder:
             Demo modunda OSM ve Esri Satellite kullanılır.
         """
         left_tile = left_tile or "OpenStreetMap"
-        right_tile = right_tile or (
-            "https://server.arcgisonline.com/ArcGIS/rest/services/"
-            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
-        )
+        right_tile = right_tile or ESRI_WORLD_IMAGERY_TILES
 
         dual_map = folium_plugins.DualMap(
             location=center,
@@ -265,7 +299,7 @@ class MapBuilder:
 
         # Sol panel
         folium.TileLayer(
-            tiles="OpenStreetMap",
+            tiles=left_tile,
             name=left_label,
         ).add_to(dual_map.m1)
 
@@ -285,7 +319,7 @@ class MapBuilder:
         image_before_path: str,
         image_after_path: str,
         bounds: List[List[float]],
-        zoom: int = 15,
+        zoom: int = DEFAULT_COMPARISON_ZOOM,
     ) -> folium.Map:
         """
         GeoTIFF/PNG görüntülerini harita üzerine overlay
@@ -345,15 +379,9 @@ class MapBuilder:
         return folium_plugins.HeatMap(
             data=coordinates_with_weights,
             name="Hasar Yoğunluk Haritası",
-            min_opacity=0.4,
-            max_zoom=18,
-            radius=25,
-            blur=15,
-            gradient={
-                0.2: "#ffffb2",
-                0.4: "#fecc5c",
-                0.6: "#fd8d3c",
-                0.8: "#f03b20",
-                1.0: "#bd0026",
-            },
+            min_opacity=HEATMAP_MIN_OPACITY,
+            max_zoom=HEATMAP_MAX_ZOOM,
+            radius=HEATMAP_RADIUS,
+            blur=HEATMAP_BLUR,
+            gradient=HEATMAP_GRADIENT,
         )

@@ -17,8 +17,8 @@ Teknik doğruluk:
     piksel yapısı (yüksek frekans bileşeni, Canny kenar tespiti compatible)
 
 Ground Truth sözlüğü sayesinde algorithm calibration:
-  gt["blocked_edges"] → doğru bloke yol listesi
-  gt["damage_ratio"]  → beklenilen hasar oranı
+  gt["blocked_segment_ids"]   → doğru bloke yol listesi
+  gt["expected_damage_ratio"] → beklenilen hasar oranı
 
 Bağımlılıklar: numpy, networkx, (opsiyonel) rasterio
 """
@@ -48,6 +48,25 @@ GRAY_ASPHALT  = 90         # Asfalt yüzey
 GRAY_BUILDING = 160        # Bina çatısı
 GRAY_DEBRIS   = 130        # Enkaz karışık dokusu (asfalt + çöküntü)
 GRAY_SKY      = 200        # Arka plan
+
+# Klip sınırları (np.clip, 0–255 gri tonlama)
+CLIP_ASPHALT_MIN  = 60     # Asfalt en koyu ton
+CLIP_ASPHALT_MAX  = 120    # Zemin asfalt en açık ton
+CLIP_ROAD_MAX     = 115    # Yol yüzeyi en açık ton
+CLIP_ROOF_MIN     = 130    # Çatı en koyu ton
+CLIP_ROOF_MAX     = 220    # Çatı en açık ton
+
+# Geometri sabitleri
+ROAD_WIDTH_PX = 6          # piksel (~3m, binek araç yolu)
+
+# Coğrafi sabitler (sol üst köşe orijini)
+ORIGIN_LAT = 38.0
+ORIGIN_LON = 37.0
+METERS_PER_DEGREE = 111320
+
+# Trafik varsayımları
+DEFAULT_SPEED_KMH = 30
+KMH_TO_MS = 3.6
 
 
 @dataclass

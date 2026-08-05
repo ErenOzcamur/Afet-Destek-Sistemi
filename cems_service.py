@@ -28,6 +28,7 @@ OGC standart endpoint'leri:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -43,6 +44,18 @@ CEMS_WFS_BASE = "https://emergency.copernicus.eu/mapping/wfs"
 CEMS_API_BASE = "https://emergency.copernicus.eu/mapping/activations"
 
 REQUEST_TIMEOUT = 20
+
+# Harita çizim sabitleri
+MARKER_RADIUS_PX = 6
+POPUP_MAX_WIDTH_PX = 220
+POLYGON_WEIGHT = 1.5
+LINE_WEIGHT = 3
+# Yarı saydam overlay alfa değeri (0-255)
+OVERLAY_ALPHA = 160
+
+# Coğrafi yaklaşık dönüşüm sabitleri
+METERS_PER_DEGREE = 111_320   # derece → metre (ekvatorda yaklaşık)
+ROAD_WIDTH_M = 6              # varsayılan yol genişliği (m)
 
 # CEMS katman isimleri (EMSR kodu ile birleştirilir)
 LAYER_TYPES = {

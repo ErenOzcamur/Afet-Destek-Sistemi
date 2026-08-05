@@ -53,6 +53,20 @@ SOURCE_COLOR = {
 
 TZ_TR = ZoneInfo("Europe/Istanbul")
 
+DEFAULT_SOURCES: Tuple[str, ...] = ("AFAD", "Kandilli", "USGS")
+DEFAULT_FETCH_LIMIT = 500
+
+MIN_MARKER_RADIUS_PX = 4
+MARKER_RADIUS_EXPONENT = 2.0
+
+# (üst sınır, seviye) — sıralı; üstüne çıkanlar "great"
+MAG_LEVEL_THRESHOLDS: Tuple[Tuple[float, str], ...] = (
+    (3.0, "low"),
+    (4.0, "moderate"),
+    (5.0, "strong"),
+    (6.0, "major"),
+)
+
 
 # ────────────────────────────────────────────────────────────
 # VERİ MODELİ
@@ -79,14 +93,9 @@ class EarthquakeEvent:
 
     @property
     def mag_level(self) -> str:
-        if self.magnitude < 3.0:
-            return "low"
-        elif self.magnitude < 4.0:
-            return "moderate"
-        elif self.magnitude < 5.0:
-            return "strong"
-        elif self.magnitude < 6.0:
-            return "major"
+        for threshold, level in MAG_LEVEL_THRESHOLDS:
+            if self.magnitude < threshold:
+                return level
         return "great"
 
     @property
@@ -96,7 +105,7 @@ class EarthquakeEvent:
     @property
     def radius(self) -> float:
         """Harita marker yarıçapı (px)."""
-        return max(4, self.magnitude ** 2.0)
+        return max(MIN_MARKER_RADIUS_PX, self.magnitude ** MARKER_RADIUS_EXPONENT)
 
     @property
     def datetime_tr(self) -> str:
@@ -104,7 +113,8 @@ class EarthquakeEvent:
         try:
             local = self.datetime_utc.astimezone(TZ_TR)
             return local.strftime("%d.%m.%Y %H:%M:%S (TR)")
-        except Exception:
+        except (ValueError, OSError) as e:
+            logger.debug(f"datetime_tr dönüşüm hatası: {e}")
             return self.datetime_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
     @property
@@ -148,6 +158,25 @@ class SeismicFetcher:
         self._session = requests.Session()
         self._session.headers.update(REQUEST_HEADERS)
 
+    def close(self) -> None:
+        """HTTP oturumunu kapatır (socket/bellek sızıntısını önler)."""
+        try:
+            self._session.close()
+        except Exception as e:
+            logger.debug(f"Session kapatma hatası: {e}")
+
+    def __enter__(self) -> "SeismicFetcher":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
     # ════════════════════════════════════════════════════════
     # PUBLIC API
     # ════════════════════════════════════════════════════════
@@ -156,7 +185,7 @@ class SeismicFetcher:
         self,
         hours: int = 24,
         min_mag: float = 1.0,
-        sources: List[str] = None,
+        sources: Optional[List[str]] = None,
     ) -> List[EarthquakeEvent]:
         """
         Tüm kaynaklardan deprem verisini çekip birleştirir.
@@ -169,31 +198,27 @@ class SeismicFetcher:
         Returns:
             Yeniden eskiye sıralı EarthquakeEvent listesi
         """
-        sources = sources or ["AFAD", "Kandilli", "USGS"]
+        sources = list(sources or DEFAULT_SOURCES)
         t0 = time.time()
         all_events: List[EarthquakeEvent] = []
-        stats: Dict = {"sources": {}, "total": 0, "elapsed_s": 0}
+        source_stats: Dict[str, Dict] = {}
 
-        if "AFAD" in sources:
-            evts, ok = self._fetch_afad(hours=hours, min_mag=min_mag)
+        for name in DEFAULT_SOURCES:
+            if name not in sources:
+                continue
+            evts, ok = self.fetch_source(name, hours=hours, min_mag=min_mag)
             all_events.extend(evts)
-            stats["sources"]["AFAD"] = {"count": len(evts), "ok": ok}
-
-        if "Kandilli" in sources:
-            evts, ok = self._fetch_kandilli(min_mag=min_mag)
-            all_events.extend(evts)
-            stats["sources"]["Kandilli"] = {"count": len(evts), "ok": ok}
-
-        if "USGS" in sources:
-            evts, ok = self._fetch_usgs(hours=hours, min_mag=min_mag)
-            all_events.extend(evts)
-            stats["sources"]["USGS"] = {"count": len(evts), "ok": ok}
+            source_stats[name] = {"count": len(evts), "ok": ok}
 
         # Sırala: yeniden eskiye
         all_events.sort(key=lambda e: e.datetime_utc, reverse=True)
 
-        stats["total"] = len(all_events)
-        stats["elapsed_s"] = round(time.time() - t0, 2)
+        # Stats'i tek seferde, yeni bir dict olarak oluştur (immutability)
+        stats: Dict = {
+            "sources": source_stats,
+            "total": len(all_events),
+            "elapsed_s": round(time.time() - t0, 2),
+        }
         self.last_fetch_stats = stats
 
         logger.info(

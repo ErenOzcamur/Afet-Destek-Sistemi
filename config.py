@@ -30,6 +30,15 @@ class CVConfig:
     # Yol segment buffer (piksel)
     road_buffer_px: int = 15
 
+    def __post_init__(self) -> None:
+        """Eşik değerlerin sıralı olduğunu doğrula (fail-fast)."""
+        if not (self.damage_threshold_low < self.damage_threshold_mid < self.damage_threshold_high):
+            raise ValueError(
+                "damage_threshold degerleri sirali olmali: "
+                f"low ({self.damage_threshold_low}) < mid ({self.damage_threshold_mid}) "
+                f"< high ({self.damage_threshold_high})"
+            )
+
 
 @dataclass(frozen=True)
 class MapConfig:
@@ -44,9 +53,9 @@ class MapConfig:
     color_safe: str = "#06d6a0"
     color_route: str = "#0077b6"
     color_blocked_road: str = "#d62828"
-    color_high: str = "#e63946"                   # alias — map_builder.py tarafından kullanılır
-    color_mid: str = "#f77f00"                    # alias — map_builder.py tarafından kullanılır
-    color_low: str = "#fcbf49"                    # alias — map_builder.py tarafından kullanılır
+    color_high: str = color_destroyed             # alias — map_builder.py tarafından kullanılır
+    color_mid: str = color_heavy                  # alias — map_builder.py tarafından kullanılır
+    color_low: str = color_moderate               # alias — map_builder.py tarafından kullanılır
 
 
 @dataclass(frozen=True)
@@ -66,6 +75,7 @@ class AppConfig:
     app_layout: str = "wide"
     log_dir: str = "logs"
     export_dir: str = "exports"
+    # Uzantılar küçük harf; karşılaştırmada filename.lower() kullanın (.TIF vb. için)
     supported_formats: Tuple[str, ...] = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
     log_level: str = "DEBUG"
     log_rotation: str = "10 MB"

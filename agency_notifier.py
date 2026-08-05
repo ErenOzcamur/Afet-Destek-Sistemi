@@ -17,14 +17,26 @@ AlertPayload şeması (kullanıcı tarafından belirlenmiş):
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from loguru import logger
+
+# ── Rapor Renk Sabitleri ────────────────────────────────────
+
+COLOR_CRITICAL = "#e63946"
+COLOR_WARNING = "#f77f00"
+BG_CRITICAL = "rgba(230,57,70,0.08)"
+BG_WARNING = "rgba(247,127,0,0.08)"
+
+
+def _dump_json(data: Dict, indent: int = 2) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=indent)
 
 
 # ── Enum'lar ────────────────────────────────────────────────
@@ -146,7 +158,7 @@ class AlertPayload:
         }
 
     def to_json(self, indent: int = 2) -> str:
-        return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
+        return _dump_json(self.to_dict(), indent=indent)
 
 
 @dataclass
@@ -178,7 +190,7 @@ class IncidentReport:
     def to_json(self, indent: int = 2) -> str:
         data = self.summary()
         data["incidents"] = [p.to_dict() for p in self.payloads]
-        return json.dumps(data, ensure_ascii=False, indent=indent)
+        return _dump_json(data, indent=indent)
 
 
 # ── Ana Sınıf ───────────────────────────────────────────────
@@ -215,46 +227,29 @@ class AgencyNotifier:
             if seg.obstruction_level == ObstructionLevel.OPEN:
                 continue
 
-            level = AlertLevel(seg.alert_level)
+            try:
+                level = AlertLevel(seg.alert_level)
+            except ValueError:
+                logger.warning(
+                    f"AgencyNotifier: geçersiz alert_level atlandı: "
+                    f"{seg.alert_level!r} ({getattr(seg, 'street_name', '?')})"
+                )
+                continue
 
             # Minimum seviye filtresi
-            if min_alert_level == AlertLevel.CRITICAL and level != AlertLevel.CRITICAL:
-                continue
-            if min_alert_level == AlertLevel.WARNING and level == AlertLevel.INFO:
+            if not self._passes_min_level(level, min_alert_level):
                 continue
 
-            obs_type  = OBSTRUCTION_MAP.get(seg.obstruction_type, ObstructionType.UNKNOWN)
-            action    = RECOMMENDED_ACTIONS.get(
-                (level.value, obs_type.value), seg.recommended_action
-            )
-            agencies  = AGENCY_ROUTING.get(obs_type, [TargetAgency.AFAD])
-            inc_id    = self._incident_id(seg)
+            payloads.append(self._build_payload(seg, level, now_utc))
 
-            payloads.append(AlertPayload(
-                incident_id        = inc_id,
-                alert_level        = level,
-                obstruction_type   = obs_type,
-                location           = IncidentLocation(
-                    lat          = seg.centroid_latlon[0],
-                    lon          = seg.centroid_latlon[1],
-                    street_name  = seg.street_name,
-                    highway_type = seg.highway_type,
-                ),
-                recommended_action = action,
-                target_agencies    = agencies,
-                texture_score      = seg.texture_score,
-                pixel_damage_ratio = seg.pixel_damage_ratio,
-                passable_vehicles  = [v.value for v in seg.passable_vehicles],
-                timestamp_utc      = now_utc,
-                satellite_source   = self.satellite_source,
-            ))
-
-        # CRITICAL önce
-        payloads.sort(key=lambda p: 0 if p.alert_level == AlertLevel.CRITICAL else 1)
+        # CRITICAL önce (yeni liste — mutasyon yok)
+        payloads = sorted(
+            payloads, key=lambda p: 0 if p.alert_level == AlertLevel.CRITICAL else 1
+        )
 
         n_crit = sum(1 for p in payloads if p.alert_level == AlertLevel.CRITICAL)
         n_warn = sum(1 for p in payloads if p.alert_level == AlertLevel.WARNING)
-        rep_id = f"MLRA-{datetime.now():%Y%m%d%H%M}-{uuid.uuid4().hex[:6].upper()}"
+        rep_id = f"MLRA-{datetime.now(timezone.utc):%Y%m%d%H%M}-{uuid.uuid4().hex[:6].upper()}"
 
         logger.info(
             f"AgencyNotifier: {len(payloads)} olay — "
@@ -276,25 +271,25 @@ class AgencyNotifier:
         """Print-to-PDF hazır, kurumsal HTML rapor üretir."""
         now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-        rows = ""
+        row_parts: List[str] = []
         for i, p in enumerate(report.payloads, 1):
-            lc  = "#e63946" if p.alert_level == AlertLevel.CRITICAL else "#f77f00"
-            lbg = "rgba(230,57,70,0.08)" if p.alert_level == AlertLevel.CRITICAL \
-                  else "rgba(247,127,0,0.08)"
-            ag  = ", ".join(a.value for a in p.target_agencies)
-            pv  = ", ".join(p.passable_vehicles) or "—"
-            rows += f"""
+            lc  = COLOR_CRITICAL if p.alert_level == AlertLevel.CRITICAL else COLOR_WARNING
+            lbg = BG_CRITICAL if p.alert_level == AlertLevel.CRITICAL else BG_WARNING
+            ag  = html.escape(", ".join(a.value for a in p.target_agencies))
+            pv  = html.escape(", ".join(p.passable_vehicles) or "—")
+            row_parts.append(f"""
             <tr style="background:{lbg}">
               <td style="text-align:center;font-weight:600">{i}</td>
               <td><span style="background:{lc};color:#fff;padding:2px 8px;
                   border-radius:4px;font-weight:700;font-size:.82em">
                   {p.alert_level.value}</span></td>
-              <td>{p.location.street_name}</td>
-              <td>{p.obstruction_type.value}</td>
-              <td style="font-size:.83em">{p.recommended_action}</td>
+              <td>{html.escape(p.location.street_name)}</td>
+              <td>{html.escape(p.obstruction_type.value)}</td>
+              <td style="font-size:.83em">{html.escape(p.recommended_action)}</td>
               <td style="font-size:.8em">{ag}</td>
               <td style="font-size:.8em">{pv}</td>
-            </tr>"""
+            </tr>""")
+        rows = "".join(row_parts)
 
         src_short = report.satellite_source.split("-")[-1] \
                     if "-" in report.satellite_source else report.satellite_source
@@ -305,9 +300,8 @@ class AgencyNotifier:
 <meta charset="UTF-8">
 <title>MLRA Raporu — {report.report_id}</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
   *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:'Inter',sans-serif;background:#f8f9fa;color:#1a1a2e;padding:32px}}
+  body{{font-family:'Inter',system-ui,sans-serif;background:#f8f9fa;color:#1a1a2e;padding:32px}}
   .hdr{{background:linear-gradient(135deg,#0f0c29,#302b63);color:#fff;
         padding:24px 32px;border-radius:12px;margin-bottom:20px}}
   .hdr h1{{font-size:1.55em;font-weight:800;margin-bottom:4px}}
@@ -317,7 +311,7 @@ class AgencyNotifier:
         box-shadow:0 2px 8px rgba(0,0,0,.06)}}
   .kpi .v{{font-size:2em;font-weight:800}}
   .kpi .l{{font-size:.78em;color:#666;margin-top:4px}}
-  .red .v{{color:#e63946}} .orange .v{{color:#f77f00}} .green .v{{color:#06d6a0}}
+  .red .v{{color:{COLOR_CRITICAL}}} .orange .v{{color:{COLOR_WARNING}}} .green .v{{color:#06d6a0}}
   table{{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;
          overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.06)}}
   th{{background:#1a1a2e;color:#fff;padding:10px 14px;font-size:.83em;text-align:left}}
@@ -363,6 +357,47 @@ class AgencyNotifier:
     # ── Yardımcı ────────────────────────────────────────────
 
     @staticmethod
+    def _passes_min_level(level: AlertLevel, min_alert_level: AlertLevel) -> bool:
+        """Minimum bildirim seviyesi filtresi."""
+        if min_alert_level == AlertLevel.CRITICAL and level != AlertLevel.CRITICAL:
+            return False
+        if min_alert_level == AlertLevel.WARNING and level == AlertLevel.INFO:
+            return False
+        return True
+
+    def _build_payload(self, seg, level: AlertLevel, now_utc: str) -> AlertPayload:
+        """Tek segmentten AlertPayload üretir."""
+        if seg.obstruction_type not in OBSTRUCTION_MAP:
+            logger.warning(
+                f"AgencyNotifier: bilinmeyen obstruction_type "
+                f"{seg.obstruction_type!r} — UNKNOWN olarak işaretlendi"
+            )
+        obs_type = OBSTRUCTION_MAP.get(seg.obstruction_type, ObstructionType.UNKNOWN)
+        action = RECOMMENDED_ACTIONS.get(
+            (level.value, obs_type.value), seg.recommended_action
+        )
+        agencies = AGENCY_ROUTING.get(obs_type, [TargetAgency.AFAD])
+
+        return AlertPayload(
+            incident_id        = self._incident_id(seg),
+            alert_level        = level,
+            obstruction_type   = obs_type,
+            location           = IncidentLocation(
+                lat          = seg.centroid_latlon[0],
+                lon          = seg.centroid_latlon[1],
+                street_name  = seg.street_name,
+                highway_type = seg.highway_type,
+            ),
+            recommended_action = action,
+            target_agencies    = agencies,
+            texture_score      = seg.texture_score,
+            pixel_damage_ratio = seg.pixel_damage_ratio,
+            passable_vehicles  = [v.value for v in seg.passable_vehicles],
+            timestamp_utc      = now_utc,
+            satellite_source   = self.satellite_source,
+        )
+
+    @staticmethod
     def _incident_id(seg) -> str:
         raw = f"{seg.centroid_latlon[0]:.5f}{seg.centroid_latlon[1]:.5f}{seg.obstruction_type}"
-        return f"INC-{hashlib.md5(raw.encode()).hexdigest()[:8].upper()}"
+        return f"INC-{hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()[:8].upper()}"

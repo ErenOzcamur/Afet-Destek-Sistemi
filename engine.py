@@ -39,7 +39,21 @@ import numpy as np
 from loguru import logger
 from skimage.metrics import structural_similarity as ssim
 
-from config import cv_config, map_config
+from config import cv_config
+
+# ────────────────────────────────────────────────────────────
+# MODÜL SABİTLERİ
+# ────────────────────────────────────────────────────────────
+
+# Yol kapanma eşiği: örtüşme oranı bu değerin üzerindeyse yol "kapalı" sayılır
+ROAD_OVERLAP_THRESHOLD = 0.3
+
+# Maske birleştirme ağırlıkları (SSIM haritası + fark haritası)
+SSIM_MASK_WEIGHT = 0.6
+DIFF_MASK_WEIGHT = 1 - SSIM_MASK_WEIGHT
+
+# Heatmap overlay harman opaklığı (hedef görüntü payı)
+HEATMAP_OVERLAY_ALPHA = 0.5
 
 
 # ────────────────────────────────────────────────────────────
@@ -225,22 +239,8 @@ class DisasterAnalyzer:
         # 9. Heatmap
         heatmap = self._generate_heatmap(diff_map, img_after)
 
-        # 10. Özet
-        total_px = g_before.shape[0] * g_before.shape[1]
-        dmg_px = sum(r.area_px for r in regions)
-        sev_dist = {"low": 0, "mid": 0, "high": 0}
-        for r in regions:
-            sev_dist[r.severity] += 1
-
-        summary = {
-            "ssim_score": round(score, 4),
-            "total_regions": len(regions),
-            "damage_area_px": dmg_px,
-            "damage_ratio": round(dmg_px / total_px, 4) if total_px else 0,
-            "severity_distribution": sev_dist,
-            "image_dims": {"h": g_before.shape[0], "w": g_before.shape[1]},
-        }
-
+        # 10. Rapor + Özet (hasar alanı tek kaynaktan:
+        # DisasterReport.total_damage_area_px)
         report = DisasterReport(
             ssim_score=score,
             ssim_map=ssim_map,
@@ -251,8 +251,22 @@ class DisasterAnalyzer:
             destroyed_buildings=destroyed,
             heavy_damage_buildings=heavy,
             moderate_damage_buildings=moderate,
-            summary=summary,
         )
+
+        total_px = g_before.shape[0] * g_before.shape[1]
+        dmg_px = report.total_damage_area_px
+        sev_dist = {"low": 0, "mid": 0, "high": 0}
+        for r in regions:
+            sev_dist[r.severity] += 1
+
+        report.summary = {
+            "ssim_score": round(score, 4),
+            "total_regions": len(regions),
+            "damage_area_px": dmg_px,
+            "damage_ratio": round(dmg_px / total_px, 4) if total_px else 0,
+            "severity_distribution": sev_dist,
+            "image_dims": {"h": g_before.shape[0], "w": g_before.shape[1]},
+        }
 
         logger.info("═══ Analiz tamamlandı ═══")
         return report
@@ -290,13 +304,17 @@ class DisasterAnalyzer:
             mask = report.binary_mask
             h, w = mask.shape[:2]
 
-            for idx, edge in edges.iterrows():
+            for _, edge in edges.iterrows():
                 road_name = edge.get("name", "İsimsiz Yol")
                 if isinstance(road_name, list):
                     road_name = road_name[0] if road_name else "İsimsiz Yol"
 
                 osm_id = str(edge.get("osmid", ""))
                 length = edge.get("length", 0)
+                # OSM çok-parçalı kenarlarda length liste dönebilir; normalize et
+                if isinstance(length, list):
+                    length = sum(length)
+                length = float(length or 0)
 
                 # Geometriyi piksel koordinatlarına dönüştür
                 # (Demo modda: rastgele örtüşme simülasyonu)
@@ -305,7 +323,7 @@ class DisasterAnalyzer:
                     coords = list(geom.coords)
                     # Basitleştirilmiş örtüşme kontrolü
                     overlap = self._check_road_overlap(coords, mask, h, w)
-                    if overlap > 0.3:
+                    if overlap > ROAD_OVERLAP_THRESHOLD:
                         blocked.append(BlockedRoad(
                             road_name=road_name,
                             osm_id=osm_id,
@@ -358,6 +376,8 @@ class DisasterAnalyzer:
 
     def _to_gray(self, img):
         if len(img.shape) == 3 and img.shape[2] >= 3:
+            if img.shape[2] == 4:
+                return cv2.cvtColor(img, cv2.COLOR_RGBA2GRAY)
             return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         return img
 
@@ -393,7 +413,9 @@ class DisasterAnalyzer:
         return diff
 
     def _create_mask(self, diff_map, ssim_map):
-        combined = cv2.addWeighted(ssim_map, 0.6, diff_map, 0.4, 0)
+        combined = cv2.addWeighted(
+            ssim_map, SSIM_MASK_WEIGHT, diff_map, DIFF_MASK_WEIGHT, 0
+        )
         _, binary = cv2.threshold(combined, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, self.cfg.morph_kernel_size)
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
@@ -475,7 +497,9 @@ class DisasterAnalyzer:
                 tgt = cv2.cvtColor(tgt, cv2.COLOR_GRAY2RGB)
             if tgt.shape[:2] != hm.shape[:2]:
                 hm = cv2.resize(hm, (tgt.shape[1], tgt.shape[0]))
-            hm = cv2.addWeighted(tgt, 0.5, hm, 0.5, 0)
+            hm = cv2.addWeighted(
+                tgt, HEATMAP_OVERLAY_ALPHA, hm, 1 - HEATMAP_OVERLAY_ALPHA, 0
+            )
         return hm
 
     # ════════════════════════════════════════════════════════

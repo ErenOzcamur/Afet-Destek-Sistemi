@@ -46,7 +46,11 @@ ITEM_TYPE_LABEL: Dict[str, str] = {
     "SkySatCollect": "SkySat Collect (0.5m)",
 }
 
-REQUEST_TIMEOUT = 15  # saniye
+REQUEST_TIMEOUT = (5, 15)  # (connect, read) saniye
+DEFAULT_RESOLUTION_M = 3.0
+SEARCH_NAME = "astro_resq_search"
+MAX_PAGES = 10
+MAX_PAGE_SIZE = 250
 
 
 @dataclass
@@ -96,6 +100,16 @@ class PlanetClient:
         self._session.headers.update({"Content-Type": "application/json"})
         logger.debug("PlanetClient başlatıldı.")
 
+    def close(self) -> None:
+        """Oturumu (session) kapatır ve bağlantı kaynaklarını serbest bırakır."""
+        self._session.close()
+
+    def __enter__(self) -> "PlanetClient":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
     # ── Public API ──────────────────────────────────────────
 
     def validate_key(self) -> bool:
@@ -130,7 +144,7 @@ class PlanetClient:
         Returns:
             PlanetScene listesi (tarih azalan sırada)
         """
-        item_types = item_types or ["PSScene"]
+        resolved_item_types = list(item_types) if item_types else ["PSScene"]
         lon_min, lat_min, lon_max, lat_max = bbox
 
         geojson_geometry = {
@@ -145,8 +159,8 @@ class PlanetClient:
         }
 
         payload = {
-            "name": "astro_resq_search",
-            "item_types": item_types,
+            "name": SEARCH_NAME,
+            "item_types": resolved_item_types,
             "filter": {
                 "type": "AndFilter",
                 "config": [
@@ -170,11 +184,20 @@ class PlanetClient:
         }
 
         scenes: List[PlanetScene] = []
-        next_url: Optional[str] = QUICK_SEARCH_URL
+        page_size = min(limit, MAX_PAGE_SIZE)
+        first_url = f"{QUICK_SEARCH_URL}?_page_size={page_size}"
+        next_url: Optional[str] = first_url
+        page_count = 0
 
         try:
             while next_url and len(scenes) < limit:
-                if next_url == QUICK_SEARCH_URL:
+                page_count += 1
+                if page_count > MAX_PAGES:
+                    logger.warning(
+                        f"Maksimum sayfa sayısına ulaşıldı ({MAX_PAGES}); eldeki {len(scenes)} sonuç döndürülüyor."
+                    )
+                    break
+                if next_url == first_url:
                     r = self._session.post(next_url, json=payload, timeout=REQUEST_TIMEOUT)
                 else:
                     r = self._session.get(next_url, timeout=REQUEST_TIMEOUT)
@@ -199,11 +222,15 @@ class PlanetClient:
             logger.error(f"Planet arama hatası: {e}")
             raise ConnectionError(f"Planet API bağlantı hatası: {e}") from e
 
-        logger.info(f"Planet arama: {len(scenes)} sahne bulundu ({', '.join(item_types)})")
+        logger.info(f"Planet arama: {len(scenes)} sahne bulundu ({', '.join(resolved_item_types)})")
         return scenes
 
     def get_thumbnail_url(self, scene: PlanetScene) -> str:
-        """Sahnenin thumbnail URL'ini döndürür (auth header gerektirir)."""
+        """Sahnenin thumbnail URL'ini döndürür (auth header gerektirir).
+
+        Not: Basit erişimcidir; yeni kod doğrudan `scene.thumbnail_url` kullanmalı.
+        Geriye dönük uyumluluk (public API) için korunmaktadır.
+        """
         return scene.thumbnail_url
 
     # ── Internal ────────────────────────────────────────────
@@ -212,8 +239,7 @@ class PlanetClient:
         """GeoJSON feature'ı PlanetScene'e dönüştürür."""
         try:
             props = feature.get("properties", {})
-            item_type = feature.get("properties", {}).get("item_type") or \
-                        feature.get("id", "").split("_")[0]
+            item_type = props.get("item_type") or feature.get("id", "").split("_")[0]
 
             # Tarih parse
             acquired_str = props.get("acquired", "")
@@ -222,6 +248,7 @@ class PlanetClient:
                     acquired_str.replace("Z", "+00:00")
                 )
             except (ValueError, AttributeError):
+                logger.warning(f"'acquired' parse edilemedi: {acquired_str!r}")
                 acquired = datetime.now(timezone.utc)
 
             thumbnail = (
@@ -229,16 +256,19 @@ class PlanetClient:
                 or feature.get("assets", {}).get("thumbnail", {}).get("location", "")
             )
 
+            raw_cc = props.get("cloud_cover")
+            cloud_cover = float(raw_cc) if raw_cc is not None else 0.0
+
             return PlanetScene(
                 scene_id=feature.get("id", ""),
                 item_type=item_type,
                 acquired=acquired,
-                cloud_cover=float(props.get("cloud_cover", 0.0)),
-                resolution_m=ITEM_TYPE_RESOLUTION.get(item_type, 3.0),
+                cloud_cover=cloud_cover,
+                resolution_m=ITEM_TYPE_RESOLUTION.get(item_type, DEFAULT_RESOLUTION_M),
                 thumbnail_url=thumbnail,
                 geometry=feature.get("geometry", {}),
                 properties=props,
             )
-        except Exception as e:
-            logger.warning(f"Sahne parse hatası: {e}")
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning(f"Sahne parse hatası (id={feature.get('id')}): {e}")
             return None

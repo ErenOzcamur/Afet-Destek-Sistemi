@@ -69,7 +69,7 @@ semantik olarak daha anlamlı segmentasyonunu sağlayabilir ancak
 GPU gerektirir ve inference süresi ~10-30x daha uzundur.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -78,6 +78,29 @@ from loguru import logger
 from skimage.metrics import structural_similarity as ssim
 
 from config import cv_config
+
+# ============================================================
+# SABİTLER
+# ============================================================
+
+SSIM_WEIGHT = 0.6  # Binary maske birleştirmede SSIM ağırlığı
+DIFF_WEIGHT = 0.4  # Binary maske birleştirmede fark ağırlığı
+OVERLAY_ALPHA = 0.5  # Heatmap alpha blending oranı
+SAM_OVERLAP_THRESHOLD = 0.3  # SAM segment / hasar örtüşme eşiği
+EPSILON = 1e-6  # Sıfıra bölme koruması
+
+
+def _severity_distribution(regions: List["DamageRegion"]) -> Dict[str, int]:
+    """Bölgelerin severity dağılımını hesaplar."""
+    dist = {"low": 0, "mid": 0, "high": 0}
+    for r in regions:
+        dist[r.severity] += 1
+    return dist
+
+
+def _total_area(regions: List["DamageRegion"]) -> float:
+    """Bölgelerin toplam piksel alanını hesaplar."""
+    return sum(r.area_px for r in regions)
 
 
 # ============================================================
@@ -113,14 +136,11 @@ class DamageReport:
 
     @property
     def total_damage_area_px(self) -> float:
-        return sum(r.area_px for r in self.regions)
+        return _total_area(self.regions)
 
     @property
     def severity_distribution(self) -> Dict[str, int]:
-        dist = {"low": 0, "mid": 0, "high": 0}
-        for r in self.regions:
-            dist[r.severity] += 1
-        return dist
+        return _severity_distribution(self.regions)
 
 
 # ============================================================
@@ -182,6 +202,16 @@ class DamageDetector:
         Raises:
             ValueError: Görüntü boyutları uyumsuzsa.
         """
+        # Girdi doğrulama (sistem sınırı)
+        if img_before is None or img_after is None:
+            raise ValueError(
+                "Geçersiz girdi: afet öncesi/sonrası görüntü None olamaz."
+            )
+        if img_before.size == 0 or img_after.size == 0:
+            raise ValueError(
+                "Geçersiz girdi: boş görüntü verildi (size == 0)."
+            )
+
         logger.info("Hasar tespiti başlatılıyor...")
 
         # --- 1. Gri tonlama ---

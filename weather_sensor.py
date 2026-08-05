@@ -122,12 +122,22 @@ DISASTER_REGIONS: Dict[str, Tuple[float, float]] = {
 OPENMETEO_URL   = "https://api.open-meteo.com/v1/forecast"
 OPENWEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
 
+# ── Modül Sabitleri ──────────────────────────────────────────
+REQUEST_TIMEOUT_S = 10          # HTTP istek zaman aşımı (saniye)
+CLOUD_UNKNOWN = -1              # bulut verisi eksik/geçersiz sentineli
+DEFAULT_VISIBILITY_M = 10_000   # OWM görüş mesafesi varsayılanı (metre)
+PRECIP_PENALTY_PER_MM = 10      # her mm yağış için efektif bulut cezası (%)
+MAX_PRECIP_PENALTY = 30         # yağış cezası tavanı (%)
+MAX_CLOUD = 100                 # efektif bulutluluk tavanı (%)
+OPTICAL_CLEAR_THRESHOLD = 20    # ≤ → İMECE (optik)
+OPTICAL_PARTIAL_THRESHOLD = 60  # ≤ → Planet SkySat (ticari optik)
+
 # Uydu profilleri
 SAT_PROFILES = {
     "İMECE":         {"type": "OPTICAL", "res_m": 0.9,  "flag": "🛰️",  "color": "#06d6a0"},
     "Göktürk-2":     {"type": "SAR",     "res_m": 2.5,  "flag": "📡",  "color": "#e63946"},
     "Planet SkySat": {"type": "OPTICAL", "res_m": 0.5,  "flag": "🛰️",  "color": "#f77f00"},
-    "Sentinel-1":    {"type": "SAR",     "res_m": 10.0, "flag": "📡",  "color": "#adb5bd"},
+    "Sentinel-1":    {"type": "SAR",     "res_m": 10.0, "flag": "📡",  "color": "#adb5bd"},  # yedek SAR (UI için)
 }
 
 
@@ -170,7 +180,8 @@ class SensorDecision:
 
     @property
     def profile(self) -> Dict:
-        return SAT_PROFILES.get(self.satellite, {})
+        # Sığ kopya: paylaşılan SAT_PROFILES sözlüğünün mutasyonunu engeller
+        return dict(SAT_PROFILES.get(self.satellite, {}))
 
     @property
     def status_color(self) -> str:
@@ -203,12 +214,15 @@ def _fetch_openmeteo(lat: float, lon: float) -> Dict:
             "forecast_days": 1,
             "timezone":      "Europe/Istanbul",
         },
-        timeout=10,
+        timeout=REQUEST_TIMEOUT_S,
     )
     r.raise_for_status()
-    cur = r.json().get("current", {})
+    body = r.json()
+    cur = body.get("current", {})
+    if not isinstance(cur, dict):
+        raise RuntimeError(f"Open-Meteo geçersiz yanıt: 'current' alanı beklenmedik tipte ({type(cur).__name__})")
     return {
-        "cloud_cover":   int(cur.get("cloud_cover", -1)),
+        "cloud_cover":   int(cur.get("cloud_cover", CLOUD_UNKNOWN)),
         "temperature":   float(cur.get("temperature_2m", 0.0)),
         "wind_speed":    float(cur.get("wind_speed_10m", 0.0)),
         "precipitation": float(cur.get("precipitation", 0.0)),
@@ -226,21 +240,27 @@ def _fetch_openweather(lat: float, lon: float, api_key: str) -> Dict:
             "units": "metric",
             "lang":  "tr",
         },
-        timeout=10,
+        timeout=REQUEST_TIMEOUT_S,
     )
     r.raise_for_status()
     data = r.json()
     return {
-        "cloud_cover":   int(data.get("clouds", {}).get("all", -1)),
+        "cloud_cover":   int(data.get("clouds", {}).get("all", CLOUD_UNKNOWN)),
         "temperature":   float(data.get("main", {}).get("temp", 0.0)),
         "wind_speed":    float(data.get("wind", {}).get("speed", 0.0)) * 3.6,  # m/s → km/h
         "precipitation": float(
+            # rain öncelikli; 0 ise snow kullanılır
             data.get("rain", {}).get("1h", 0.0) or
             data.get("snow", {}).get("1h", 0.0)
         ),
-        "visibility":    int(data.get("visibility", 10000)),
+        "visibility":    int(data.get("visibility", DEFAULT_VISIBILITY_M)),
         "description":   data.get("weather", [{}])[0].get("description", ""),
     }
+
+
+def _is_valid_cloud(v: Optional[int]) -> bool:
+    """Bulut değeri geçerli mi (None ve CLOUD_UNKNOWN sentineli hariç)."""
+    return v is not None and v >= 0
 
 
 def fetch_weather(region: str, owm_api_key: Optional[str] = None) -> WeatherReading:
@@ -274,8 +294,9 @@ def fetch_weather(region: str, owm_api_key: Optional[str] = None) -> WeatherRead
     try:
         omm_data = _fetch_openmeteo(lat, lon)
         logger.info(f"Open-Meteo: bulut={omm_data['cloud_cover']}% — {region}")
-    except Exception as e:
-        logger.warning(f"Open-Meteo hatası: {e}")
+    except (requests.RequestException, ValueError, KeyError, RuntimeError) as e:
+        logger.warning(f"Open-Meteo hatası: {e!r}")
+        logger.debug("Open-Meteo hata ayrıntısı", exc_info=True)
 
     # ── OpenWeatherMap (ikincil, opsiyonel) ───────────────────
     owm_data: Optional[Dict] = None
@@ -283,8 +304,9 @@ def fetch_weather(region: str, owm_api_key: Optional[str] = None) -> WeatherRead
         try:
             owm_data = _fetch_openweather(lat, lon, owm_api_key)
             logger.info(f"OWM: bulut={owm_data['cloud_cover']}% — {region}")
-        except Exception as e:
-            logger.warning(f"OpenWeatherMap hatası: {e}")
+        except (requests.RequestException, ValueError, KeyError, RuntimeError) as e:
+            logger.warning(f"OpenWeatherMap hatası: {e!r}")
+            logger.debug("OpenWeatherMap hata ayrıntısı", exc_info=True)
 
     if omm_data is None and owm_data is None:
         raise RuntimeError("Her iki hava durumu API'si de yanıt vermedi.")
@@ -293,23 +315,28 @@ def fetch_weather(region: str, owm_api_key: Optional[str] = None) -> WeatherRead
     omm_cloud = omm_data["cloud_cover"] if omm_data else None
     owm_cloud  = owm_data["cloud_cover"] if owm_data else None
 
-    if omm_cloud is not None and owm_cloud is not None and omm_cloud >= 0 and owm_cloud >= 0:
+    if _is_valid_cloud(omm_cloud) and _is_valid_cloud(owm_cloud):
         # İki kaynak ortalaması — daha güvenilir ölçüm
         fused_cloud = (omm_cloud + owm_cloud) // 2
         source = "Fused (OMM + OWM)"
-    elif omm_cloud is not None and omm_cloud >= 0:
+    elif _is_valid_cloud(omm_cloud):
         fused_cloud = omm_cloud
         source = "Open-Meteo"
     else:
-        fused_cloud = owm_cloud if owm_cloud is not None and owm_cloud >= 0 else 0
+        if _is_valid_cloud(owm_cloud):
+            fused_cloud = owm_cloud
+        else:
+            fused_cloud = 0
+            logger.warning("Bulut verisi geçersiz, 0 varsayıldı — karar güvenilirliği düşük")
         source = "OpenWeatherMap"
 
-    # Sıcaklık, rüzgar, yağış — önce OWM (m/s→km/h zaten çevrildi), yoksa OMM
+    # Sıcaklık, rüzgar, yağış — önce OWM (m/s→km/h zaten çevrildi), yoksa OMM.
+    # Her iki fetch fonksiyonu da bu anahtarları her zaman döndürür; default salt güvenlik amaçlı.
     base = owm_data if owm_data else omm_data
-    temp   = float(base.get("temperature",   omm_data["temperature"]   if omm_data else 0.0))
-    wind   = float(base.get("wind_speed",    omm_data["wind_speed"]    if omm_data else 0.0))
-    precip = float(base.get("precipitation", omm_data["precipitation"] if omm_data else 0.0))
-    vis    = int(base.get("visibility", 10000))
+    temp   = float(base.get("temperature",   0.0))
+    wind   = float(base.get("wind_speed",    0.0))
+    precip = float(base.get("precipitation", 0.0))
+    vis    = int(base.get("visibility", DEFAULT_VISIBILITY_M))
     desc   = owm_data.get("description", "") if owm_data else ""
 
     return WeatherReading(
@@ -337,10 +364,10 @@ def make_decision(region: str, weather: WeatherReading) -> SensorDecision:
       21-60% → Planet SkySat (ticari optik, 0.5m GSD)
       > 60% → Göktürk-2 (SAR, bulut/gece etkisiz)
     """
-    precip_penalty = min(30, int(weather.precipitation * 10))
-    eff = min(100, weather.cloud_cover + precip_penalty)
+    precip_penalty = min(MAX_PRECIP_PENALTY, int(weather.precipitation * PRECIP_PENALTY_PER_MM))
+    eff = min(MAX_CLOUD, weather.cloud_cover + precip_penalty)
 
-    if eff <= 20:
+    if eff <= OPTICAL_CLEAR_THRESHOLD:
         satellite = "İMECE"
         status    = "OPEN"
         conf      = "HIGH"
@@ -350,7 +377,7 @@ def make_decision(region: str, weather: WeatherReading) -> SensorDecision:
             f"İMECE'nin 0.9 m GSD çözünürlüğü yapı hasarını, yol kapanmalarını ve "
             f"heyelan alanlarını net olarak tespit edebilir. SAR'a geçiş gerekli değil."
         )
-    elif eff <= 60:
+    elif eff <= OPTICAL_PARTIAL_THRESHOLD:
         satellite = "Planet SkySat"
         status    = "PARTIAL"
         conf      = "MEDIUM"

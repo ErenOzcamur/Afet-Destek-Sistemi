@@ -55,6 +55,20 @@ NDBI_BUILT_THR      = 0.0    # > 0.0 → yapılı alan baskın
 # Z-score eşiği (change detection)
 ZSCORE_ANOMALY_THR  = 2.5
 
+# Normalizasyon sabitleri
+UINT16_REFLECTANCE_SCALE = 10000.0
+UINT8_SCALE              = 255.0
+
+# Sayısal koruma sabitleri
+EPSILON           = 1e-6
+MIN_BASELINE_STD  = 1.0
+
+# Zaman serisi sabitleri
+BASELINE_RATIO    = 0.6
+MAX_CHANGE_EVENTS = 50
+SEVERITY_HIGH_Z   = 4.0
+SEVERITY_MEDIUM_Z = 3.0
+
 
 # ── Dataclass'lar ────────────────────────────────────────────
 
@@ -117,7 +131,10 @@ class SpectralAnalyzer:
             image_4band: (H, W, 4) veya (4, H, W) float32/uint16 array
                         Bant sırası: Blue, Green, Red, NIR
         """
-        if image_4band.ndim == 3 and image_4band.shape[0] == 4:
+        if image_4band.ndim != 3:
+            raise ValueError("3 boyutlu (H, W, C) veya (C, H, W) array bekleniyor")
+
+        if image_4band.shape[0] == 4:
             # (4, H, W) → (H, W, 4)
             image_4band = np.moveaxis(image_4band, 0, -1)
 
@@ -126,9 +143,9 @@ class SpectralAnalyzer:
 
         # uint16 → float [0, 1] normalize
         if image_4band.dtype == np.uint16:
-            self._img = image_4band.astype(np.float32) / 10000.0
+            self._img = image_4band.astype(np.float32) / UINT16_REFLECTANCE_SCALE
         elif image_4band.dtype == np.uint8:
-            self._img = image_4band.astype(np.float32) / 255.0
+            self._img = image_4band.astype(np.float32) / UINT8_SCALE
         else:
             self._img = image_4band.astype(np.float32)
 
@@ -180,34 +197,39 @@ class SpectralAnalyzer:
         NDVI değerlerini RGB renk haritasına dönüştürür.
         -1 → kırmızı (su/yapı), 0 → sarı (çıplak toprak), +1 → koyu yeşil (bitki)
         """
-        try:
-            import cv2
-            normalized = np.clip((ndvi + 1) / 2 * 255, 0, 255).astype(np.uint8)
-            colormap   = cv2.applyColorMap(normalized, cv2.COLORMAP_RdYlGn)
-            return cv2.cvtColor(colormap, cv2.COLOR_BGR2RGB)
-        except ImportError:
-            # Fallback: basit RGB
-            rgb = np.zeros((*ndvi.shape, 3), dtype=np.uint8)
-            rgb[:, :, 1] = np.clip((ndvi * 127 + 127), 0, 255).astype(np.uint8)
-            return rgb
+        return self._apply_colormap(ndvi, "COLORMAP_RdYlGn", fallback_channel=1)
 
     def ndwi_colormap(self, ndwi: np.ndarray) -> np.ndarray:
         """NDWI → mavi tonlama (su bölgeleri mavi)."""
+        return self._apply_colormap(ndwi, "COLORMAP_OCEAN", fallback_channel=2)
+
+    @staticmethod
+    def _apply_colormap(
+        index_arr: np.ndarray,
+        cv2_colormap_name: str,
+        fallback_channel: int,
+    ) -> np.ndarray:
+        """[-1, 1] indeks → RGB renk haritası; cv2 yoksa basit tek kanal fallback."""
+        normalized = np.clip((index_arr + 1) / 2 * 255, 0, 255).astype(np.uint8)
         try:
             import cv2
-            normalized = np.clip((ndwi + 1) / 2 * 255, 0, 255).astype(np.uint8)
-            colormap   = cv2.applyColorMap(normalized, cv2.COLORMAP_OCEAN)
+            colormap = cv2.applyColorMap(normalized, getattr(cv2, cv2_colormap_name))
             return cv2.cvtColor(colormap, cv2.COLOR_BGR2RGB)
         except ImportError:
-            rgb = np.zeros((*ndwi.shape, 3), dtype=np.uint8)
-            rgb[:, :, 2] = np.clip((ndwi * 127 + 127), 0, 255).astype(np.uint8)
+            logger.warning("cv2 bulunamadı, basit renk haritası fallback'i kullanılıyor")
+            rgb = np.zeros((*index_arr.shape, 3), dtype=np.uint8)
+            rgb[:, :, fallback_channel] = np.clip(
+                (index_arr * 127 + 127), 0, 255
+            ).astype(np.uint8)
             return rgb
 
     @staticmethod
     def _safe_index(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         """(A - B) / (A + B) — sıfıra bölme koruması."""
         denom = a + b
-        return np.where(np.abs(denom) > 1e-6, (a - b) / denom, 0.0)
+        out = np.zeros_like(a, dtype=np.float32)
+        np.divide(a - b, denom, out=out, where=np.abs(denom) > EPSILON)
+        return out
 
 
 # ── Zaman Serisi Analizi ─────────────────────────────────────
@@ -241,6 +263,10 @@ class TimeSeriesAnalyzer:
         if len(images) < 2:
             raise ValueError("Zaman serisi analizi için en az 2 görüntü gereklidir.")
 
+        for i, img in enumerate(images):
+            if img.ndim not in (2, 3):
+                raise ValueError(f"Görüntü {i}: 2B veya 3B array bekleniyor")
+
         # Gri tonlamaya dönüştür
         grays = []
         for img in images:
@@ -264,7 +290,7 @@ class TimeSeriesAnalyzer:
 
     def analyze(
         self,
-        baseline_frames:   int   = None,
+        baseline_frames:   Optional[int] = None,
         zscore_threshold:  float = ZSCORE_ANOMALY_THR,
         cusum_k:           float = 0.5,
         cusum_h:           float = 5.0,
@@ -281,17 +307,26 @@ class TimeSeriesAnalyzer:
         Returns:
             TimeSeriesResult
         """
-        n_base = baseline_frames or max(1, int(self._T * 0.6))
+        if baseline_frames is not None and baseline_frames <= 0:
+            raise ValueError("baseline_frames pozitif bir tamsayı olmalıdır")
+
+        n_base = (
+            baseline_frames if baseline_frames is not None
+            else max(1, int(self._T * BASELINE_RATIO))
+        )
         n_base = min(n_base, self._T - 1)
 
         baseline  = self._stack[:n_base]
-        bl_mean   = baseline.mean(axis=0)    # (H, W)
-        bl_std    = baseline.std(axis=0)
-        bl_std    = np.where(bl_std < 1.0, 1.0, bl_std)   # min std=1
+        bl_mean   = baseline.mean(axis=0).astype(np.float32)    # (H, W)
+        bl_std    = np.maximum(
+            baseline.std(axis=0).astype(np.float32), MIN_BASELINE_STD
+        )
 
-        # Z-score haritası (tüm frameler)
-        z_stack   = (self._stack - bl_mean[np.newaxis]) / bl_std[np.newaxis]
-        anomaly_z = np.max(np.abs(z_stack[n_base:]), axis=0)   # (H, W)
+        # Z-score haritası — frame-frame artımlı hesap (bellek dostu)
+        anomaly_z = np.zeros((self._H, self._W), dtype=np.float32)
+        for t in range(n_base, self._T):
+            z_frame = (self._stack[t] - bl_mean) / bl_std
+            anomaly_z = np.maximum(anomaly_z, np.abs(z_frame))
         anomaly_mask = (anomaly_z > zscore_threshold).astype(np.uint8) * 255
 
         # CUSUM — değişim başlangıcı
@@ -299,8 +334,8 @@ class TimeSeriesAnalyzer:
             bl_mean, bl_std, n_base, cusum_k, cusum_h
         )
 
-        # Anomali olay listesi (en yüksek z-score'dan ilk 50)
-        events = self._extract_events(z_stack, n_base, zscore_threshold)
+        # Anomali olay listesi
+        events = self._extract_events(bl_mean, bl_std, n_base, zscore_threshold)
 
         change_score = float(np.mean(anomaly_mask > 0))
 
@@ -357,8 +392,8 @@ class TimeSeriesAnalyzer:
         Her frame için ortalama CUSUM değeri hesaplanır.
         Eşiği aşan ilk frame = değişim başlangıcı.
         """
-        cusum_pos = np.zeros((self._H, self._W))
-        cusum_neg = np.zeros((self._H, self._W))
+        cusum_pos = np.zeros((self._H, self._W), dtype=np.float32)
+        cusum_neg = np.zeros((self._H, self._W), dtype=np.float32)
         max_cusum = 0.0
         first_change = self._T - 1
 
@@ -376,15 +411,19 @@ class TimeSeriesAnalyzer:
 
     def _extract_events(
         self,
-        z_stack:   np.ndarray,
+        bl_mean:   np.ndarray,
+        bl_std:    np.ndarray,
         n_base:    int,
         threshold: float,
-        max_events: int = 50,
+        max_events: int = MAX_CHANGE_EVENTS,
     ) -> List[ChangeEvent]:
-        """En yüksek z-score anomali piksellerini olay listesine dönüştürür."""
+        """
+        Eşiği aşan ilk pikselleri (satır sırasıyla) olay listesine dönüştürür,
+        ardından |z|'ye göre büyükten küçüğe sıralar.
+        """
         events = []
         for t in range(n_base, self._T):
-            z_frame = z_stack[t]
+            z_frame = (self._stack[t] - bl_mean) / bl_std
             ys, xs  = np.where(np.abs(z_frame) > threshold)
             for y, x in zip(ys[:max_events], xs[:max_events]):
                 z_val = float(z_frame[y, x])
@@ -395,8 +434,9 @@ class TimeSeriesAnalyzer:
                     z_score     = z_val,
                     cusum_value = 0.0,
                     change_type = "increase" if z_val > 0 else "decrease",
-                    severity    = ("high"   if abs(z_val) > 4.0 else
-                                   "medium" if abs(z_val) > 3.0 else "low"),
+                    severity    = ("high"   if abs(z_val) > SEVERITY_HIGH_Z else
+                                   "medium" if abs(z_val) > SEVERITY_MEDIUM_Z
+                                   else "low"),
                 ))
             if len(events) >= max_events:
                 break
@@ -410,15 +450,21 @@ class TimeSeriesAnalyzer:
         """Görüntü boyutunu hedef boyuta getirir."""
         if img.shape == (h, w):
             return img
+
+        logger.warning(f"Frame {img.shape} -> ({h},{w}) yeniden boyutlandırıldı")
         try:
             from PIL import Image as _PIL
-            return np.array(
-                _PIL.fromarray(img.astype(np.uint8)).resize((w, h))
-            ).astype(np.float32)
+            clipped = np.clip(img, 0, 255).astype(np.uint8)
+            resized = _PIL.fromarray(clipped).resize((w, h))
+            return np.array(resized).astype(np.float32)
         except ImportError:
-            return img[:h, :w] if img.shape[0] >= h and img.shape[1] >= w \
-                   else np.pad(img, ((0, max(0, h - img.shape[0])),
-                                    (0, max(0, w - img.shape[1]))))[:h, :w]
+            logger.warning("PIL bulunamadı, kırp/doldur fallback'i kullanılıyor")
+            pad_h = max(0, h - img.shape[0])
+            pad_w = max(0, w - img.shape[1])
+            if pad_h == 0 and pad_w == 0:
+                return img[:h, :w]
+            padded = np.pad(img, ((0, pad_h), (0, pad_w)))
+            return padded[:h, :w]
 
 
 # ── Yardımcı: RGB'den Sahte 4-Bant ──────────────────────────

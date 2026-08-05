@@ -23,12 +23,28 @@ Gerçek zamanlı trafik verisi içermez.
 48 saatlik sprint için yeterli bir yaklaşımdır.
 """
 
-from typing import Dict, List, Optional, Set, Tuple
+import itertools
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from loguru import logger
 
 from config import routing_config
+
+# ── Modül sabitleri ──────────────────────────────────────────
+DEFAULT_SPEED_KMH = 50
+DAMAGE_PENALTY_FACTOR = 100
+DEFAULT_EDGE_TRAVEL_TIME_S = 60
+DEFAULT_BLOCK_THRESHOLD = 0.30
+DEFAULT_DAMAGE_THRESHOLD = 0.10
+MAX_SAMPLES_PER_SEGMENT = 80
+BLOCKED_WEIGHT = 9_999_999
+DAMAGED_PENALTY_FACTOR = 2
+NARROW_PENALTY = 3.0
+NARROW_TYPES = frozenset(
+    {"residential", "footway", "path", "track", "service", "unclassified"}
+)
+AVG_SPEED_MPS = 8.33  # ~30 km/h
 
 
 class SafeRouteOptimizer:

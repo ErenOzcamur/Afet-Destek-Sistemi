@@ -23,9 +23,33 @@ import json
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from html import escape
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
+
+# Modül seviyesi sabitler
+DEFAULT_AFAD_ENDPOINT = "https://api.afad.gov.tr/v1/disaster-reports"
+REQUEST_TIMEOUT_S = 30
+
+
+def _now_utc() -> datetime:
+    """Tutarlı zaman kaynağı: her zaman UTC döndürür."""
+    return datetime.now(timezone.utc)
+
+
+def _normalize_coords(coords) -> List[List[float]]:
+    """Koordinat listesini [[lat, lon], ...] biçimine normalleştirir.
+
+    Geçersiz veya 2 elemandan kısa öğeleri loglayarak atlar.
+    """
+    normalized: List[List[float]] = []
+    for c in coords:
+        try:
+            normalized.append([c[0], c[1]])
+        except (IndexError, TypeError, KeyError) as e:
+            logger.warning(f"Geçersiz koordinat atlandı: {c!r} ({e})")
+    return normalized
 
 
 # ============================================================
@@ -94,6 +118,11 @@ class NotificationBuilder:
         result = builder.simulate_afad_sync(payload)
     """
 
+    STATUS_BLOCKED = "BLOCKED"
+    STATUS_DAMAGED = "DAMAGED"
+    STATUS_OPEN = "OPEN"
+    CLOSED_STATUSES = (STATUS_BLOCKED, STATUS_DAMAGED)
+
     DISASTER_TYPES_TR = {
         "earthquake": "Deprem",
         "flood": "Sel / Su Taşkını",
@@ -107,9 +136,9 @@ class NotificationBuilder:
     def build_from_analysis(
         self,
         report,
-        road_statuses: Dict,
-        route_primary: Optional[Dict],
-        route_alternative: Optional[Dict],
+        road_statuses: Dict[str, Dict[str, Any]],
+        route_primary: Optional[Dict[str, Any]],
+        route_alternative: Optional[Dict[str, Any]],
         disaster_type: str = "earthquake",
         location_name: str = "Afet Bölgesi",
         center_coords: Tuple[float, float] = (37.75, 37.01),
@@ -132,24 +161,25 @@ class NotificationBuilder:
             AFADPayload nesnesi.
         """
         incident_id = (
-            f"ASTRO-{datetime.now():%Y%m%d%H%M}-"
+            f"ASTRO-{_now_utc():%Y%m%d%H%M}-"
             f"{uuid.uuid4().hex[:6].upper()}"
         )
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = _now_utc().isoformat()
 
         # Executive summary
-        es: Dict = {}
+        es: Dict[str, Any] = {}
         if hasattr(report, "get_executive_summary"):
             try:
                 es = report.get_executive_summary()
-            except Exception:
+            except (AttributeError, KeyError, TypeError, ValueError) as e:
+                logger.warning(f"Executive summary alinamadi: {e}")
                 es = {}
 
         # Kapalı / hasarlı yollar
         closed_roads: List[AFADRoadEntry] = []
         for osm_id, data in road_statuses.items():
-            status = data.get("status", "OPEN")
-            if status in ("BLOCKED", "DAMAGED"):
+            status = data.get("status", self.STATUS_OPEN)
+            if status in self.CLOSED_STATUSES:
                 dmg_ratio = data.get("damage_ratio", 0.0)
                 closed_roads.append(AFADRoadEntry(
                     road_name=data.get("road_name", "İsimsiz Yol"),
@@ -158,7 +188,7 @@ class NotificationBuilder:
                     damage_ratio=dmg_ratio,
                     damage_percentage=f"{dmg_ratio * 100:.1f}%",
                     length_m=data.get("length_m", 0.0),
-                    coords=[[c[0], c[1]] for c in data.get("geometry_coords", [])],
+                    coords=_normalize_coords(data.get("geometry_coords", [])),
                 ))
 
         # Güvenli rotalar
@@ -168,19 +198,18 @@ class NotificationBuilder:
             (2, "Alternatif Güvenli Rota", route_alternative),
         ]:
             if route:
-                coords_raw = route.get("coordinates", [])
                 alternative_routes.append(AFADRouteEntry(
                     route_id=route_id,
                     label=label,
                     total_length_m=route.get("total_length_m", 0.0),
                     total_time_min=round(route.get("total_time_s", 0.0) / 60.0, 1),
                     passes_damage=bool(route.get("passes_damage", False)),
-                    coords=[[c[0], c[1]] for c in coords_raw],
+                    coords=_normalize_coords(route.get("coordinates", [])),
                 ))
 
         # Tahminî hasar seviyesi
-        blocked_list  = [v for v in road_statuses.values() if v.get("status") == "BLOCKED"]
-        damaged_list  = [v for v in road_statuses.values() if v.get("status") == "DAMAGED"]
+        blocked_list  = [v for v in road_statuses.values() if v.get("status") == self.STATUS_BLOCKED]
+        damaged_list  = [v for v in road_statuses.values() if v.get("status") == self.STATUS_DAMAGED]
         total_blocked_length = sum(v.get("length_m", 0) for v in blocked_list)
 
         estimated_damage_level = {
@@ -229,35 +258,34 @@ class NotificationBuilder:
         now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
 
         # Yol tablosu satırları
-        road_rows_html = ""
-        for road in payload.closed_roads:
-            badge_color = "#e63946" if road.status == "BLOCKED" else "#f77f00"
-            badge_label = "KAPALI" if road.status == "BLOCKED" else "HASARLI"
-            road_rows_html += f"""
+        road_rows = [
+            f"""
             <tr>
-                <td>{road.road_name}</td>
-                <td><span class="badge" style="background:{badge_color}">{badge_label}</span></td>
-                <td>{road.damage_percentage}</td>
+                <td>{escape(road.road_name)}</td>
+                <td><span class="badge" style="background:{'#e63946' if road.status == self.STATUS_BLOCKED else '#f77f00'}">{'KAPALI' if road.status == self.STATUS_BLOCKED else 'HASARLI'}</span></td>
+                <td>{escape(road.damage_percentage)}</td>
                 <td>{road.length_m:.0f} m</td>
             </tr>"""
-
-        if not road_rows_html:
-            road_rows_html = '<tr><td colspan="4" style="text-align:center;opacity:0.5">Kapalı yol tespit edilmedi</td></tr>'
+            for road in payload.closed_roads
+        ]
+        road_rows_html = "".join(road_rows) or (
+            '<tr><td colspan="4" style="text-align:center;opacity:0.5">Kapalı yol tespit edilmedi</td></tr>'
+        )
 
         # Rota tablosu satırları
-        route_rows_html = ""
-        for route in payload.alternative_routes:
-            status_icon = "⚠️ Dikkatli" if route.passes_damage else "✅ Güvenli"
-            route_rows_html += f"""
+        route_rows = [
+            f"""
             <tr>
-                <td><b>{route.label}</b></td>
+                <td><b>{escape(route.label)}</b></td>
                 <td>{route.total_length_m:.0f} m</td>
                 <td>{route.total_time_min:.1f} dk</td>
-                <td>{status_icon}</td>
+                <td>{'⚠️ Dikkatli' if route.passes_damage else '✅ Güvenli'}</td>
             </tr>"""
-
-        if not route_rows_html:
-            route_rows_html = '<tr><td colspan="4" style="text-align:center;opacity:0.5">Rota hesaplanamadı</td></tr>'
+            for route in payload.alternative_routes
+        ]
+        route_rows_html = "".join(route_rows) or (
+            '<tr><td colspan="4" style="text-align:center;opacity:0.5">Rota hesaplanamadı</td></tr>'
+        )
 
         html = f"""<!DOCTYPE html>
 <html lang="tr">

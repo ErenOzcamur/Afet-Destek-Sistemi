@@ -21,14 +21,20 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import numpy as np
 from loguru import logger
 
 
 # ── Sabitler ────────────────────────────────────────────────
+
+REQUEST_TIMEOUT_SECONDS = 120
+MAX_OUTPUT_TOKENS = 2048
+JPEG_QUALITY = 85
+RESOLUTION_PLACEHOLDER = "0.5m çözünürlüklü"
 
 ANALYSIS_PROMPT = """Ekteki 0.5m çözünürlüklü uydu görüntüsünde yer alan yol ağını analiz et.
 
@@ -229,8 +235,10 @@ class AIVisionAnalyzer:
         logger.info("AI Vision: tek görüntü analizi başlatılıyor...")
         img_b64 = self._encode_image(image)
 
+        if RESOLUTION_PLACEHOLDER not in ANALYSIS_PROMPT:
+            logger.debug("ANALYSIS_PROMPT içinde çözünürlük ifadesi bulunamadı; replace etkisiz.")
         prompt = ANALYSIS_PROMPT.replace(
-            "0.5m çözünürlüklü", f"{resolution_label} çözünürlüklü"
+            RESOLUTION_PLACEHOLDER, f"{resolution_label} çözünürlüklü"
         )
 
         response = self._call_api(
@@ -318,7 +326,6 @@ class AIVisionAnalyzer:
         try:
             import google.generativeai as genai
             from PIL import Image as _PILImage
-            import io as _io
 
             genai.configure(api_key=self._api_key)
             model = genai.GenerativeModel(self.GEMINI_MODEL)
@@ -333,13 +340,22 @@ class AIVisionAnalyzer:
                     elif block.get("type") == "image":
                         src = block.get("source", {})
                         if src.get("type") == "base64":
-                            import base64 as _b64
-                            img_bytes = _b64.b64decode(src["data"])
-                            pil_img = _PILImage.open(_io.BytesIO(img_bytes))
+                            img_bytes = base64.b64decode(src["data"])
+                            pil_img = _PILImage.open(io.BytesIO(img_bytes))
                             content_parts.append(pil_img)
 
-            response = model.generate_content(content_parts)
-            text_out = response.text if response.text else ""
+            response = model.generate_content(
+                content_parts,
+                request_options={"timeout": REQUEST_TIMEOUT_SECONDS},
+            )
+            try:
+                text_out = response.text or ""
+            except ValueError as exc:
+                # Safety filter vb. nedeniyle yanıt bloklandığında .text ValueError fırlatır
+                logger.error(f"Gemini yanıtı bloklandı (safety filter olabilir): {exc}")
+                raise ConnectionError(
+                    f"Gemini yanıtı alınamadı (içerik bloklanmış olabilir): {exc}"
+                ) from exc
 
             # Token sayısı (Gemini metadata'dan)
             usage = getattr(response, "usage_metadata", None)
@@ -357,21 +373,29 @@ class AIVisionAnalyzer:
                 "google-generativeai paketi gereklidir: "
                 "pip install google-generativeai"
             )
+        except ConnectionError:
+            raise
         except Exception as exc:
+            logger.error(f"Gemini API hatası ({type(exc).__name__}): {exc}")
             raise ConnectionError(f"Gemini API hatası: {exc}") from exc
 
     def _call_anthropic(self, messages: List[Dict]) -> Dict:
         """Anthropic Claude API çağrısı (ücretli)."""
         try:
             import anthropic
-            client = anthropic.Anthropic(api_key=self._api_key)
+            client = anthropic.Anthropic(
+                api_key=self._api_key, timeout=REQUEST_TIMEOUT_SECONDS
+            )
             msg = client.messages.create(
                 model      = self.ANTHROPIC_MODEL,
-                max_tokens = 2048,
+                max_tokens = MAX_OUTPUT_TOKENS,
                 messages   = messages,
             )
+            content_text = (
+                getattr(msg.content[0], "text", "") if msg.content else ""
+            )
             return {
-                "content":       msg.content[0].text if msg.content else "",
+                "content":       content_text,
                 "model":         msg.model,
                 "input_tokens":  msg.usage.input_tokens,
                 "output_tokens": msg.usage.output_tokens,
@@ -379,6 +403,7 @@ class AIVisionAnalyzer:
         except ImportError:
             raise ImportError("anthropic paketi gereklidir: pip install anthropic")
         except Exception as exc:
+            logger.error(f"Anthropic API hatası ({type(exc).__name__}): {exc}")
             raise ConnectionError(f"Anthropic API hatası: {exc}") from exc
 
     def _encode_image(self, image: np.ndarray) -> str:
@@ -386,11 +411,17 @@ class AIVisionAnalyzer:
         from PIL import Image
 
         # Boyut sınırlama (Claude Vision max boyut)
-        arr = image.copy()
+        # Not: copy() gereksiz — aşağıdaki dallar yeni array üretir, giriş mutasyona uğramaz
+        arr = image
         if arr.ndim == 2:
             arr = np.stack([arr] * 3, axis=-1)
-        elif arr.shape[2] == 4:
+        elif arr.ndim == 3 and arr.shape[2] == 4:
             arr = arr[:, :, :3]
+        elif arr.ndim != 3 or arr.shape[2] != 3:
+            raise ValueError(
+                f"Desteklenmeyen görüntü biçimi: ndim={arr.ndim}, "
+                f"shape={arr.shape} (2B gri veya 3/4 kanallı olmalı)"
+            )
 
         h, w = arr.shape[:2]
         max_d = self.MAX_IMAGE_DIM
@@ -405,8 +436,40 @@ class AIVisionAnalyzer:
             pil = Image.fromarray(arr.astype(np.uint8))
 
         buf = io.BytesIO()
-        pil.save(buf, format="JPEG", quality=85)
+        pil.save(buf, format="JPEG", quality=JPEG_QUALITY)
         return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    def _default_model(self) -> str:
+        """Backend'e göre öntanımlı model adı (DRY)."""
+        return self.GEMINI_MODEL if self._backend == "gemini" else self.ANTHROPIC_MODEL
+
+    @staticmethod
+    def _safe_status(item: Dict[str, Any], *keys: str) -> str:
+        """None-güvenli status okuma; bilinmeyen değerleri logla, varsayılan OPEN."""
+        raw_value = next((item.get(k) for k in keys if item.get(k)), None)
+        status = str(raw_value or "OPEN").upper()
+        if status not in STATUS_COLOR:
+            logger.warning(f"Bilinmeyen yol durumu: {status!r}")
+        return status
+
+    def _make_result(
+        self,
+        response: Dict[str, Any],
+        mode: str,
+        roads: List[AIRoadStatus],
+        summary: Dict[str, Any],
+        raw: str,
+    ) -> AIAnalysisResult:
+        """Ortak AIAnalysisResult kurulumu (DRY)."""
+        return AIAnalysisResult(
+            mode          = mode,
+            roads         = roads,
+            summary       = summary,
+            raw_response  = raw,
+            model_used    = response.get("model", self._default_model()),
+            input_tokens  = response.get("input_tokens", 0),
+            output_tokens = response.get("output_tokens", 0),
+        )
 
     def _parse_single_response(self, response: Dict) -> AIAnalysisResult:
         """API yanıtını AIAnalysisResult'a çevirir (tek görüntü modu)."""
@@ -421,14 +484,17 @@ class AIVisionAnalyzer:
             for item in data.get("roads", []):
                 roads.append(AIRoadStatus(
                     road_id           = item.get("id", f"R{len(roads)+1:03d}"),
-                    status            = item.get("status", "OPEN").upper(),
+                    status            = self._safe_status(item, "status"),
                     location_desc     = item.get("location_desc", ""),
                     visual_evidence   = item.get("visual_evidence", ""),
-                    confidence        = item.get("confidence", "MEDIUM").upper(),
+                    confidence        = str(item.get("confidence") or "MEDIUM").upper(),
                     recommended_action= item.get("recommended_action", ""),
                 ))
-        except Exception as exc:
-            logger.warning(f"AI yanıt parse hatası: {exc} — ham metin döndürülüyor")
+        except (ValueError, json.JSONDecodeError, TypeError) as exc:
+            logger.warning(
+                f"AI yanıt parse hatası: {exc} — ham metin döndürülüyor "
+                f"(ilk 200 karakter: {raw[:200]!r})"
+            )
 
         logger.info(
             f"AI Vision (single): {len(roads)} yol — "
@@ -437,15 +503,7 @@ class AIVisionAnalyzer:
             f"Kısıtlı:{sum(1 for r in roads if r.status=='RESTRICTED')}"
         )
 
-        return AIAnalysisResult(
-            mode          = "single",
-            roads         = roads,
-            summary       = summary,
-            raw_response  = raw,
-            model_used    = response.get("model", self.GEMINI_MODEL if self._backend == "gemini" else self.ANTHROPIC_MODEL),
-            input_tokens  = response.get("input_tokens", 0),
-            output_tokens = response.get("output_tokens", 0),
-        )
+        return self._make_result(response, "single", roads, summary, raw)
 
     def _parse_before_after_response(self, response: Dict) -> AIAnalysisResult:
         """Before/After modu yanıt parse."""
@@ -458,40 +516,40 @@ class AIVisionAnalyzer:
             summary = data.get("comparison_summary", {})
             for item in data.get("roads", []):
                 # Durum: post_status öncelikli
-                status = item.get("post_status", item.get("status", "OPEN")).upper()
+                status = self._safe_status(item, "post_status", "status")
                 roads.append(AIRoadStatus(
                     road_id           = item.get("id", f"R{len(roads)+1:03d}"),
                     status            = status,
                     location_desc     = item.get("location_desc", ""),
                     visual_evidence   = item.get("change_evidence",
                                                   item.get("visual_evidence", "")),
-                    confidence        = item.get("confidence", "MEDIUM").upper(),
-                    pre_status        = item.get("pre_status", "OPEN").upper(),
+                    confidence        = str(item.get("confidence") or "MEDIUM").upper(),
+                    pre_status        = self._safe_status(item, "pre_status"),
                     post_status       = status,
                 ))
-        except Exception as exc:
-            logger.warning(f"AI before/after parse hatası: {exc}")
+        except (ValueError, json.JSONDecodeError, TypeError) as exc:
+            logger.warning(
+                f"AI before/after parse hatası: {exc} "
+                f"(ilk 200 karakter: {raw[:200]!r})"
+            )
 
-        return AIAnalysisResult(
-            mode          = "before_after",
-            roads         = roads,
-            summary       = summary,
-            raw_response  = raw,
-            model_used    = response.get("model", self.GEMINI_MODEL if self._backend == "gemini" else self.ANTHROPIC_MODEL),
-            input_tokens  = response.get("input_tokens", 0),
-            output_tokens = response.get("output_tokens", 0),
-        )
+        return self._make_result(response, "before_after", roads, summary, raw)
 
     @staticmethod
     def _extract_json(text: str) -> Dict:
         """Metin içindeki ilk JSON bloğunu çıkarır."""
-        import re
         # ```json ... ``` bloğunu ara
         m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
         if m:
-            return json.loads(m.group(1))
+            try:
+                return json.loads(m.group(1))
+            except json.JSONDecodeError as exc:
+                raise ValueError("JSON bulunamadı") from exc
         # Doğrudan JSON
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if m:
-            return json.loads(m.group(0))
+            try:
+                return json.loads(m.group(0))
+            except json.JSONDecodeError as exc:
+                raise ValueError("JSON bulunamadı") from exc
         raise ValueError("JSON bulunamadı")
