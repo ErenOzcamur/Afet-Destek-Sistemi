@@ -6,7 +6,7 @@
 # --- Core Framework ---
 streamlit==1.61.0
 streamlit-image-comparison>=0.0.4
-streamlit-js-eval>=0.1.7
+streamlit-js-eval>=1.0.0
 
 # --- GIS & Mapping ---
 folium>=0.16.0
