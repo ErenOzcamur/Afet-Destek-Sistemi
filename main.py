@@ -11,6 +11,7 @@ Ağır kütüphaneler fonksiyon içinde lazy-import yapılır.
 """
 
 import html as _html_esc
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -21,6 +22,8 @@ import streamlit as st
 from PIL import Image
 
 from config import app_config, cv_config, map_config
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -614,7 +617,8 @@ with _tab_met:
             except ImportError as _fie:
                 st.warning(f"Folium kütüphanesi eksik: {_fie}")
             except Exception as _fme:
-                st.error(f"Harita hatası: {_fme}")
+                logger.exception("Harita olusturma hatasi: %r", _fme)
+                st.error("Harita oluşturulurken bir hata oluştu.")
 
         with _fay_col_info:
             st.markdown("#### 📋 Tarihi Yıkıcı Depremler")
@@ -690,7 +694,8 @@ with _tab_seis:
                 (afad_evts, afad_ok), (kand_evts, kand_ok), (usgs_evts, usgs_ok) = \
                     _load_seismic_split(sf_hours, sf_min_mag, sf_region)
             except Exception as _e:
-                st.error(f"Sismik veri hatası: {_e}")
+                logger.exception("Sismik veri hatasi: %r", _e)
+                st.error("Sismik veriler alınırken bir hata oluştu.")
                 afad_evts = kand_evts = usgs_evts = []
                 afad_ok = kand_ok = usgs_ok = False
 
@@ -2006,7 +2011,8 @@ Kısa, net, madde madde yaz."""
                 except ImportError as _ie:
                     st.error(f"Eksik paket: {_ie}. `pip install osmnx networkx` çalıştırın.")
                 except Exception as _le:
-                    st.error(f"Rota hesaplama hatası: {_le}")
+                    logger.exception("Rota hesaplama hatasi: %r", _le)
+                    st.error("Rota hesaplanırken bir hata oluştu.")
 
         if st.session_state.get("loj_map") is not None:
             _rf = st.session_state["loj_route_found"]
