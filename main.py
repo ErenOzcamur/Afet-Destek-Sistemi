@@ -10,6 +10,7 @@ cv2 bu dosyada top-level import EDİLMEZ.
 Ağır kütüphaneler fonksiyon içinde lazy-import yapılır.
 """
 
+import html as _html_esc
 import os
 import tempfile
 from pathlib import Path
@@ -432,7 +433,7 @@ with _tab_met:
             f"""<div style="background:{_ws_bg};border-left:4px solid {_ws_border};
                 padding:12px 16px;border-radius:8px;margin:8px 0">
                 <b style="color:{_ws_border}">{_wd.profile.get('flag','🛰️')} {_wd.status_label_tr}</b><br>
-                <span style="opacity:0.9">{_wd.decision_text}</span>
+                <span style="opacity:0.9">{_html_esc.escape(str(_wd.decision_text))}</span>
             </div>""",
             unsafe_allow_html=True,
         )
@@ -761,7 +762,7 @@ with _tab_seis:
                     _rows_html = ""
                     for _ev in _evts[:15]:
                         _mag_clr = _ev.color
-                        _loc = _ev.location[:32] + ("…" if len(_ev.location) > 32 else "")
+                        _loc = _html_esc.escape(_ev.location[:32] + ("…" if len(_ev.location) > 32 else ""))
                         _ago = f"{_ev.age_minutes:.0f}dk"
                         _rows_html += (
                             f'<div style="display:flex;align-items:center;gap:6px;'
@@ -1160,7 +1161,8 @@ with _tab_img:
             with _col_left:
                 # ── Hasar Tespiti ──
                 st.markdown("""<div style="font-weight:700;font-size:0.95em;color:#4361ee;margin-bottom:8px">🏚️ Hasar Tespiti</div>""", unsafe_allow_html=True)
-                for _item in _r["hasar_tespiti"]:
+                for _raw_item in _r["hasar_tespiti"]:
+                    _item = _html_esc.escape(str(_raw_item))
                     st.markdown(f"""<div style="background:rgba(255,255,255,0.04);border-left:3px solid #4361ee;
                         padding:0.6rem 0.9rem;border-radius:0 8px 8px 0;margin-bottom:6px;font-size:0.88em;color:#ddd">{_item}</div>""", unsafe_allow_html=True)
 
@@ -1191,7 +1193,9 @@ with _tab_img:
             with _col_right:
                 # ── Risk Bölgeleri ──
                 st.markdown("""<div style="font-weight:700;font-size:0.95em;color:#4361ee;margin-bottom:8px">⚠️ Risk Bölgeleri</div>""", unsafe_allow_html=True)
-                for _bolge, _aciklama, _icon in _r["risk_bölgeleri"]:
+                for _raw_bolge, _raw_aciklama, _icon in _r["risk_bölgeleri"]:
+                    _bolge = _html_esc.escape(str(_raw_bolge))
+                    _aciklama = _html_esc.escape(str(_raw_aciklama))
                     st.markdown(f"""<div style="background:rgba(255,255,255,0.04);border-radius:8px;
                         padding:0.65rem 0.9rem;margin-bottom:6px;font-size:0.87em">
                         <span style="font-weight:700;color:#fff">{_icon} {_bolge}</span><br>
@@ -1204,10 +1208,10 @@ with _tab_img:
                 _krt = _r["kurtarma"]
                 st.markdown(f"""
                 <div style="background:rgba(255,255,255,0.04);border-radius:8px;padding:0.8rem 1rem;font-size:0.87em">
-                  <div style="margin-bottom:6px"><span style="color:#f77f00;font-weight:700">🎯 Öncelikli:</span> <span style="color:#ddd">{_krt['oncelikli']}</span></div>
-                  <div style="margin-bottom:6px"><span style="color:#4361ee;font-weight:700">🗺️ Erişim:</span> <span style="color:#ddd">{_krt['erisim']}</span></div>
+                  <div style="margin-bottom:6px"><span style="color:#f77f00;font-weight:700">🎯 Öncelikli:</span> <span style="color:#ddd">{_html_esc.escape(str(_krt['oncelikli']))}</span></div>
+                  <div style="margin-bottom:6px"><span style="color:#4361ee;font-weight:700">🗺️ Erişim:</span> <span style="color:#ddd">{_html_esc.escape(str(_krt['erisim']))}</span></div>
                   <div><span style="color:#06d6a0;font-weight:700">🔧 Ekipman:</span><br>
-                  {"".join(f'<span style="display:inline-block;background:rgba(6,214,160,0.12);border:1px solid rgba(6,214,160,0.3);border-radius:20px;padding:2px 10px;margin:3px 3px 0 0;font-size:0.85em;color:#06d6a0">{e}</span>' for e in _krt['ekipman'])}
+                  {"".join(f'<span style="display:inline-block;background:rgba(6,214,160,0.12);border:1px solid rgba(6,214,160,0.3);border-radius:20px;padding:2px 10px;margin:3px 3px 0 0;font-size:0.85em;color:#06d6a0">{_html_esc.escape(str(e))}</span>' for e in _krt['ekipman'])}
                   </div>
                 </div>""", unsafe_allow_html=True)
 
@@ -1216,7 +1220,7 @@ with _tab_img:
             # ── Özet ──
             st.markdown(f"""<div style="background:rgba(230,57,70,0.08);border:1px solid rgba(230,57,70,0.25);
                 border-radius:10px;padding:1rem 1.2rem;font-size:0.9em;color:#ddd;line-height:1.7">
-                <span style="color:#e63946;font-weight:700">📌 Genel Değerlendirme</span><br>{_r['ozet']}</div>""", unsafe_allow_html=True)
+                <span style="color:#e63946;font-weight:700">📌 Genel Değerlendirme</span><br>{_html_esc.escape(str(_r['ozet']))}</div>""", unsafe_allow_html=True)
 
             st.markdown("<br>", unsafe_allow_html=True)
             import json as _json_rep
