@@ -81,3 +81,10 @@ report = detector.detect_damage_with_sam(before, after)
 ## 📝 Lisans
 
 Hackathon projesidir. Afet müdahale amacıyla serbestçe kullanılabilir.
+
+## Gizli Anahtarlar
+
+API anahtarlarini asla koda veya git'e koymayin.
+
+- Yerel gelistirme: `cp .env.example .env` veya `.streamlit/secrets.toml` (ikisi de `.gitignore`da).
+- Streamlit Cloud: Settings > Secrets bolumune girin.
