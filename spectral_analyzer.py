@@ -374,7 +374,7 @@ class TimeSeriesAnalyzer:
         vals    = self._stack[:, y, x]
         baseline= vals[:max(1, len(vals) // 2)]
         mean    = baseline.mean()
-        std     = max(1.0, baseline.std())
+        std     = max(MIN_BASELINE_STD, baseline.std())
         zscores = (vals - mean) / std
         return vals, zscores
 

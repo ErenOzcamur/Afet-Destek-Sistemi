@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, Iterator, List, Optional, Tuple
 
+import networkx as nx
 import numpy as np
 from loguru import logger
 
@@ -312,7 +313,6 @@ class MLRAEngine:
         """
         try:
             import osmnx as ox
-            import networkx as nx
 
             constraints  = VEHICLE_CONSTRAINTS[vehicle_type]
             allowed_hway = set(constraints["can_use"])
@@ -397,13 +397,7 @@ class MLRAEngine:
         except nx.NetworkXNoPath as exc:
             logger.warning(f"Taktik rota bulunamadı ({vehicle_type.value}): {exc}")
             return None
-        except (ImportError, KeyError) as exc:
-            logger.error(
-                f"Taktik rota hatası ({vehicle_type.value}): "
-                f"{type(exc).__name__}: {exc}", exc_info=True
-            )
-            return None
-        except Exception as exc:
+        except (ImportError, KeyError, Exception) as exc:
             logger.error(
                 f"Taktik rota hatası ({vehicle_type.value}): "
                 f"{type(exc).__name__}: {exc}", exc_info=True
@@ -437,6 +431,24 @@ class MLRAEngine:
 
     # ── İç Metodlar ─────────────────────────────────────────
 
+    def _iter_sample_points(
+        self, coords: List[Tuple], max_samples: int
+    ) -> Iterator[Tuple[int, int]]:
+        """Segment boyunca örnekleme piksel noktaları (cx, cy) üretir."""
+        for i in range(len(coords) - 1):
+            p1 = self._latlon_to_px(coords[i])
+            p2 = self._latlon_to_px(coords[i + 1])
+            if p1 is None or p2 is None:
+                continue
+            n = max(
+                self.MIN_SAMPLES_PER_SEGMENT,
+                int(np.hypot(p2[0] - p1[0], p2[1] - p1[1])),
+            )
+            for t in np.linspace(0, 1, min(n, max_samples)):
+                cx = int(p1[0] + t * (p2[0] - p1[0]))
+                cy = int(p1[1] + t * (p2[1] - p1[1]))
+                yield cx, cy
+
     def _sample_damage(self, coords: List[Tuple]) -> float:
         """
         Segment üzerindeki hasar piksel oranı.
@@ -444,23 +456,18 @@ class MLRAEngine:
         0.5m/px'de: her 50cm'lik dilim bağımsız değerlendirilebilir.
         2.5m/px'de: aynı enkaz bloğu tek piksele sığar, oran kaybolur.
         """
-        samples: List[bool] = []
-        for i in range(len(coords) - 1):
-            p1 = self._latlon_to_px(coords[i])
-            p2 = self._latlon_to_px(coords[i + 1])
-            if p1 is None or p2 is None:
+        total = 0
+        hits = 0
+        for cx, cy in self._iter_sample_points(coords, self.DAMAGE_MAX_SAMPLES):
+            ys = cy + self._disk_dy
+            xs = cx + self._disk_dx
+            valid = (ys >= 0) & (ys < self._h) & (xs >= 0) & (xs < self._w)
+            if not valid.any():
                 continue
-            n = max(4, int(np.hypot(p2[0] - p1[0], p2[1] - p1[1])))
-            for t in np.linspace(0, 1, min(n, 60)):
-                cx = int(p1[0] + t * (p2[0] - p1[0]))
-                cy = int(p1[1] + t * (p2[1] - p1[1]))
-                for dy in range(-self._buf_px, self._buf_px + 1):
-                    for dx in range(-self._buf_px, self._buf_px + 1):
-                        if dx * dx + dy * dy <= self._buf_px ** 2:
-                            ny, nx_ = cy + dy, cx + dx
-                            if 0 <= ny < self._h and 0 <= nx_ < self._w:
-                                samples.append(bool(self.binary_mask[ny, nx_]))
-        return float(np.mean(samples)) if samples else 0.0
+            vals = self.binary_mask[ys[valid], xs[valid]]
+            total += int(vals.size)
+            hits += int(vals.sum())
+        return hits / total if total else 0.0
 
     def _analyze_texture(
         self, coords: List[Tuple]
@@ -479,28 +486,22 @@ class MLRAEngine:
             # Fallback: yalnızca hasar maskesi
             return self._sample_damage(coords), 0.0
 
-        pixels: List[float] = []
-        for i in range(len(coords) - 1):
-            p1 = self._latlon_to_px(coords[i])
-            p2 = self._latlon_to_px(coords[i + 1])
-            if p1 is None or p2 is None:
-                continue
-            n = max(4, int(np.hypot(p2[0] - p1[0], p2[1] - p1[1])))
-            for t in np.linspace(0, 1, min(n, 40)):
-                cx = int(p1[0] + t * (p2[0] - p1[0]))
-                cy = int(p1[1] + t * (p2[1] - p1[1]))
-                y0 = max(0, cy - self._buf_px)
-                y1 = min(self._h, cy + self._buf_px + 1)
-                x0 = max(0, cx - self._buf_px)
-                x1 = min(self._w, cx + self._buf_px + 1)
-                patch = self.gray_image[y0:y1, x0:x1]
-                if patch.size:
-                    pixels.extend(patch.flatten().tolist())
+        patches: List[np.ndarray] = []
+        n_pixels = 0
+        for cx, cy in self._iter_sample_points(coords, self.TEXTURE_MAX_SAMPLES):
+            y0 = max(0, cy - self._buf_px)
+            y1 = min(self._h, cy + self._buf_px + 1)
+            x0 = max(0, cx - self._buf_px)
+            x1 = min(self._w, cx + self._buf_px + 1)
+            patch = self.gray_image[y0:y1, x0:x1]
+            if patch.size:
+                patches.append(patch.astype(np.float32).ravel())
+                n_pixels += patch.size
 
-        if len(pixels) < 10:
+        if n_pixels < 10:
             return 0.0, 0.0
 
-        arr      = np.array(pixels, dtype=np.float32)
+        arr      = np.concatenate(patches)
         variance = float(np.var(arr))
         # 0.5m/px kalibrasyonu: varyans eşikleri 2.5m/px'den daha dar aralıkta
         score = min(1.0, max(0.0,

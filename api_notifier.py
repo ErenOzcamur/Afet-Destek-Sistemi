@@ -577,7 +577,7 @@ class NotificationBuilder:
     def simulate_afad_sync(
         self,
         payload: AFADPayload,
-        endpoint_url: str = "https://api.afad.gov.tr/v1/disaster-reports",
+        endpoint_url: str = DEFAULT_AFAD_ENDPOINT,
     ) -> Dict:
         """
         AFAD API senkronizasyonunu simüle eder.
@@ -596,7 +596,7 @@ class NotificationBuilder:
                     "Content-Type": "application/json",
                     "X-ASTRO-RESQ-Version": "2.0",
                 },
-                timeout=30,
+                timeout=REQUEST_TIMEOUT_S,
             )
             response.raise_for_status()
             return response.json()
@@ -610,16 +610,18 @@ class NotificationBuilder:
 
         try:
             payload_json = payload.to_json()
-            checksum = hashlib.md5(payload_json.encode()).hexdigest()
+            checksum = hashlib.md5(
+                payload_json.encode(), usedforsecurity=False
+            ).hexdigest()
             afad_tracking_no = (
-                f"AFAD-{datetime.now():%Y%m%d}-{checksum[:8].upper()}"
+                f"AFAD-{_now_utc():%Y%m%d}-{checksum[:8].upper()}"
             )
 
             result = {
                 "status": "success",
                 "incident_id": payload.incident_id,
                 "afad_tracking_no": afad_tracking_no,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": _now_utc().isoformat(),
                 "message": "Afet bildirimi başarıyla AFAD sistemine iletildi.",
                 "endpoint": endpoint_url,
                 "payload_size_bytes": len(payload_json.encode("utf-8")),
@@ -631,8 +633,8 @@ class NotificationBuilder:
             )
             return result
 
-        except Exception as e:
-            logger.error(f"AFAD sync hatası: {e}")
+        except (TypeError, ValueError) as e:
+            logger.exception(f"AFAD sync hatası: {e}")
             return {
                 "status": "error",
                 "error": str(e),

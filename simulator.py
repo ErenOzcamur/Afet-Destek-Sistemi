@@ -105,7 +105,11 @@ class SimulationResult:
               "geo_transform" : rasterio.Affine | None,
             }
         """
-        import cv2
+        try:
+            import cv2
+        except ImportError as exc:
+            logger.error("opencv-python yüklü değil — analyzer paketi oluşturulamadı")
+            raise ImportError("opencv-python yüklü değil") from exc
         before_bgr = cv2.cvtColor(self.pre_image,  cv2.COLOR_GRAY2BGR)
         after_bgr  = cv2.cvtColor(self.post_image, cv2.COLOR_GRAY2BGR)
         return {
@@ -134,7 +138,7 @@ class SimulationEngine:
     def __init__(self, config: Optional[SimulationConfig] = None):
         self.cfg = config or SimulationConfig()
         self._rng = np.random.default_rng(self.cfg.seed)
-        random.seed(self.cfg.seed)
+        self._py_rng = random.Random(self.cfg.seed)
 
     def run(self) -> SimulationResult:
         """Tam simülasyonu çalıştırır."""
@@ -145,8 +149,8 @@ class SimulationEngine:
 
         pre, building_rects, road_lines = self._build_pre_disaster()
         graph, road_segments, edge_map  = self._build_road_graph(road_lines)
-        post, blocked_edges, gt         = self._build_post_disaster(
-            pre, building_rects, road_lines, road_segments, edge_map
+        post, _, gt                     = self._build_post_disaster(
+            pre, building_rects, road_segments
         )
 
         # Opsiyonel: rasterio Affine (sol üst köşe = 37.0°E, 38.0°N)
@@ -185,7 +189,9 @@ class SimulationEngine:
 
         # 1. Zemin: asfalt + düşük frekanslı homojen gürültü
         noise = self._rng.normal(0, self.cfg.noise_std * 0.5, (size, size))
-        base  = np.clip(GRAY_ASPHALT + noise, 60, 120).astype(np.uint8)
+        base  = np.clip(
+            GRAY_ASPHALT + noise, CLIP_ASPHALT_MIN, CLIP_ASPHALT_MAX
+        ).astype(np.uint8)
         img[:] = base
 
         # 2. Yol gridini çiz
@@ -199,19 +205,20 @@ class SimulationEngine:
 
     def _draw_road_grid(self, img: np.ndarray) -> List[Tuple]:
         """
-        Düzenli yol grid'i çizer. 0.5m/px'de 6m yol = 12px genişlik.
+        Düzenli yol grid'i çizer. 0.5m/px'de 6px yol ≈ 3m genişlik.
         SSIM için: yollar düzgün, enkaz sonrası fark belirgin.
         """
         size = self.cfg.size
         bs   = self.cfg.block_size   # blok aralığı (piksel)
-        road_w = 6                   # piksel (~3m, binek araç yolu)
+        road_w = ROAD_WIDTH_PX
         road_lines = []
 
         # Yatay yollar
         y = bs
         while y < size - bs:
             img[y:y + road_w, :] = np.clip(
-                GRAY_ASPHALT + self._rng.normal(0, 8, (road_w, size)), 60, 115
+                GRAY_ASPHALT + self._rng.normal(0, 8, (road_w, size)),
+                CLIP_ASPHALT_MIN, CLIP_ROAD_MAX
             ).astype(np.uint8)
             road_lines.append(("H", y, y + road_w, 0, size))
             y += bs
@@ -220,7 +227,8 @@ class SimulationEngine:
         x = bs
         while x < size - bs:
             img[:, x:x + road_w] = np.clip(
-                GRAY_ASPHALT + self._rng.normal(0, 8, (size, road_w)), 60, 115
+                GRAY_ASPHALT + self._rng.normal(0, 8, (size, road_w)),
+                CLIP_ASPHALT_MIN, CLIP_ROAD_MAX
             ).astype(np.uint8)
             road_lines.append(("V", x, x + road_w, 0, size))
             x += bs
@@ -236,7 +244,7 @@ class SimulationEngine:
         """
         size = self.cfg.size
         bs   = self.cfg.block_size
-        road_w = 6
+        road_w = ROAD_WIDTH_PX
         rects = []
 
         h_roads = [r for r in road_lines if r[0] == "H"]
@@ -256,7 +264,9 @@ class SimulationEngine:
 
                 # Bina iç dolgusu + çatı gürültüsü
                 patch = self._rng.normal(GRAY_BUILDING, 10, (y1 - y0, x1 - x0))
-                img[y0:y1, x0:x1] = np.clip(patch, 130, 220).astype(np.uint8)
+                img[y0:y1, x0:x1] = np.clip(
+                    patch, CLIP_ROOF_MIN, CLIP_ROOF_MAX
+                ).astype(np.uint8)
                 rects.append((x0, y0, x1, y1))
 
         return rects

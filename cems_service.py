@@ -196,15 +196,9 @@ class CEMSService:
                 allow_redirects=True,
             )
             if r.status_code == 200:
-                # XML'den katman isimlerini çıkar (basit string parse)
-                for lt, label in LAYER_TYPES.items():
-                    layer_name = f"{code}_{lt}"
-                    layers.append(CEMSLayer(
-                        layer_name = layer_name,
-                        label      = label,
-                        wms_url    = wms_url,
-                        emsr_code  = code,
-                    ))
+                # Katman listesi statik üretilir (GetCapabilities yalnızca
+                # erişilebilirlik kontrolü — yanıt gövdesi tutulmaz)
+                layers = self._static_layers(code, wms_url)
                 logger.info(f"CEMS WMS: {len(layers)} katman — {code}")
             else:
                 # Sunucu erişilemez → sabit bilinen katmanları döndür
@@ -222,6 +216,9 @@ class CEMSService:
         """
         leafmap / Folium TileLayer için WMS tile URL şablonu.
         {z}/{x}/{y} yerine Folium'un WMS parametrelerini kullanır.
+
+        Not: layer.wms_url üzerinde ince sarmalayıcıdır (public API
+        sözleşmesi gereği korunur).
 
         Returns:
             Folium WMS katman eklemek için tam base URL
@@ -261,8 +258,10 @@ class CEMSService:
                 opacity  = opacity,
             ).add_to(folium_map)
             logger.debug(f"WMS katmanı eklendi: {layer.layer_name}")
+        except ImportError:
+            logger.error("folium kurulu değil — WMS katmanı eklenemiyor")
         except Exception as exc:
-            logger.error(f"WMS katman ekleme hatası: {exc}")
+            logger.error(f"WMS katman ekleme hatası ({type(exc).__name__}): {exc}")
 
     def add_wms_to_leafmap(
         self,

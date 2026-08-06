@@ -237,13 +237,29 @@ class SeismicFetcher:
         min_mag: float = 1.0,
     ) -> Tuple[List[EarthquakeEvent], bool]:
         """Tek bir kaynaktan veri çeker."""
-        if source == "AFAD":
-            return self._fetch_afad(hours=hours, min_mag=min_mag)
-        elif source == "Kandilli":
-            return self._fetch_kandilli(min_mag=min_mag)
-        elif source == "USGS":
-            return self._fetch_usgs(hours=hours, min_mag=min_mag)
-        return [], False
+        dispatch = {
+            "AFAD":     lambda: self._fetch_afad(hours=hours, min_mag=min_mag),
+            "Kandilli": lambda: self._fetch_kandilli(min_mag=min_mag),
+            "USGS":     lambda: self._fetch_usgs(hours=hours, min_mag=min_mag),
+        }
+        fetcher = dispatch.get(source)
+        if fetcher is None:
+            logger.warning(f"Bilinmeyen kaynak: {source!r}")
+            return [], False
+        return fetcher()
+
+    def _parse_and_filter(
+        self,
+        items: List,
+        parser,
+        min_mag: float,
+    ) -> List[EarthquakeEvent]:
+        """Ham item listesini parse edip min_mag filtresi uygular."""
+        return [
+            evt
+            for evt in (parser(item) for item in items)
+            if evt is not None and evt.magnitude >= min_mag
+        ]
 
     # ════════════════════════════════════════════════════════
     # AFAD
@@ -253,7 +269,7 @@ class SeismicFetcher:
         self,
         hours: int = 24,
         min_mag: float = 1.0,
-        limit: int = 500,
+        limit: int = DEFAULT_FETCH_LIMIT,
     ) -> Tuple[List[EarthquakeEvent], bool]:
         """
         AFAD Deprem API.
@@ -283,11 +299,7 @@ class SeismicFetcher:
                 logger.warning(f"AFAD: Beklenmeyen yanıt formatı: {type(data)}")
                 return [], False
 
-            events = []
-            for item in data:
-                evt = self._parse_afad_item(item)
-                if evt and evt.magnitude >= min_mag:
-                    events.append(evt)
+            events = self._parse_and_filter(data, self._parse_afad_item, min_mag)
 
             logger.debug(f"AFAD: {len(events)} deprem alındı.")
             return events, True
@@ -298,8 +310,14 @@ class SeismicFetcher:
         except requests.exceptions.ConnectionError:
             logger.warning("AFAD API: Bağlantı hatası.")
             return [], False
-        except Exception as e:
-            logger.error(f"AFAD API hatası: {e}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"AFAD API HTTP hatası: {e}")
+            return [], False
+        except ValueError as e:
+            logger.error(f"AFAD API JSON parse hatası: {e}")
+            return [], False
+        except Exception:
+            logger.exception("AFAD API beklenmeyen hata")
             return [], False
 
     def _parse_afad_item(self, item: Dict) -> Optional[EarthquakeEvent]:
@@ -316,7 +334,8 @@ class SeismicFetcher:
                 dt = datetime.fromisoformat(date_str)
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
-            except Exception:
+            except (ValueError, TypeError):
+                logger.debug(f"AFAD tarih parse edilemedi: {date_str!r}")
                 dt = datetime.now(timezone.utc)
 
             location = item.get("location", "")
@@ -362,16 +381,18 @@ class SeismicFetcher:
             resp.raise_for_status()
             data = resp.json()
 
+            if not isinstance(data, dict):
+                logger.warning("Kandilli: Beklenmeyen yanıt formatı")
+                return [], False
+
             if not data.get("status"):
                 logger.warning("Kandilli: status=False")
                 return [], False
 
             result = data.get("result", [])
-            events = []
-            for item in result:
-                evt = self._parse_kandilli_item(item)
-                if evt and evt.magnitude >= min_mag:
-                    events.append(evt)
+            events = self._parse_and_filter(
+                result, self._parse_kandilli_item, min_mag
+            )
 
             logger.debug(f"Kandilli: {len(events)} deprem alındı.")
             return events, True
@@ -379,8 +400,17 @@ class SeismicFetcher:
         except requests.exceptions.Timeout:
             logger.warning("Kandilli API: Zaman aşımı.")
             return [], False
-        except Exception as e:
-            logger.error(f"Kandilli API hatası: {e}")
+        except requests.exceptions.ConnectionError:
+            logger.warning("Kandilli API: Bağlantı hatası.")
+            return [], False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Kandilli API HTTP hatası: {e}")
+            return [], False
+        except ValueError as e:
+            logger.error(f"Kandilli API JSON parse hatası: {e}")
+            return [], False
+        except Exception:
+            logger.exception("Kandilli API beklenmeyen hata")
             return [], False
 
     def _parse_kandilli_item(self, item: Dict) -> Optional[EarthquakeEvent]:

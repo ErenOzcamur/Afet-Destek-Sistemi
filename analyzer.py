@@ -25,6 +25,17 @@ from skimage.metrics import structural_similarity as ssim
 
 from config import cv_config, routing_config, CVConfig
 
+# ── Modül sabitleri ─────────────────────────────────────────
+# SSIM/diff birleştirme ağırlıkları (detect_changes + run_full_analysis)
+SSIM_DAMAGE_WEIGHT = 0.6
+DIFF_WEIGHT = 0.4
+# Heatmap harmanlama ağırlıkları
+HEATMAP_BASE_ALPHA = 0.45
+HEATMAP_OVERLAY_ALPHA = 0.55
+# Yol engelleme parametreleri
+DEFAULT_TRAVEL_TIME_S = 60
+BLOCKED_PENALTY_FACTOR = 100
+
 
 # ============================================================
 #  DATA STRUCTURES
@@ -200,6 +211,28 @@ class DamageEngine:
             b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_AREA)
         return a, b
 
+    def _prepare_grays(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Her iki görüntüyü gri tona çevirir ve boyutlarını eşleştirir."""
+        gray_b = self._to_gray(self.before_img)
+        gray_a = self._to_gray(self.after_img)
+        return self._match_dimensions(gray_b, gray_a)
+
+    def _compute_ssim(
+        self, gray_b: np.ndarray, gray_a: np.ndarray
+    ) -> Tuple[float, np.ndarray]:
+        """SSIM skorunu ve haritasını hesaplar."""
+        score, ssim_map = ssim(
+            gray_b, gray_a,
+            win_size=self.cfg.ssim_win_size,
+            gaussian_weights=self.cfg.ssim_gaussian_weights,
+            full=True,
+        )
+        return float(score), ssim_map
+
+    def _severity_score_from_area(self, area_px: float) -> float:
+        """Piksel alanından normalize severity skoru (0-1) üretir."""
+        return min(area_px / max(1, self.cfg.building_max_area), 1.0)
+
     def _classify_severity(self, score: float) -> str:
         """Hasar skoru → severity etiketi."""
         if score >= self.cfg.damage_threshold_high:
@@ -216,22 +249,13 @@ class DamageEngine:
         Döndürülen değer: binary_mask (uint8, 0/255)
         """
         try:
-            gray_b = self._to_gray(self.before_img)
-            gray_a = self._to_gray(self.after_img)
-            gray_b, gray_a = self._match_dimensions(gray_b, gray_a)
-
-            win = self.cfg.ssim_win_size
-            _, ssim_map = ssim(
-                gray_b, gray_a,
-                win_size=win,
-                gaussian_weights=self.cfg.ssim_gaussian_weights,
-                full=True,
-            )
+            gray_b, gray_a = self._prepare_grays()
+            _, ssim_map = self._compute_ssim(gray_b, gray_a)
             ssim_damage = (1.0 - ssim_map).astype(np.float32)
 
             diff = cv2.absdiff(gray_b, gray_a).astype(np.float32) / 255.0
 
-            combined = 0.6 * ssim_damage + 0.4 * diff
+            combined = SSIM_DAMAGE_WEIGHT * ssim_damage + DIFF_WEIGHT * diff
             combined_u8 = (combined * 255).astype(np.uint8)
 
             _, binary = cv2.threshold(

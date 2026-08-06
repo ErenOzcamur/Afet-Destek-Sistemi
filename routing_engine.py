@@ -64,6 +64,7 @@ class SafeRouteOptimizer:
         self.graph = None
         self.damaged_edges = set()
         self.blocked_edges = set()
+        self._road_damage_cache: Dict[str, dict] = {}
         self._osmnx = None
         self._nx = None
 
@@ -107,7 +108,9 @@ class SafeRouteOptimizer:
             logger.error("osmnx yüklü değil.")
             return None
 
-        network_type = network_type or self.config.network_type
+        network_type = (
+            self.config.network_type if network_type is None else network_type
+        )
 
         try:
             logger.info(
@@ -121,7 +124,9 @@ class SafeRouteOptimizer:
             )
 
             # Seyahat süresi hesapla (hız bilgisine göre)
-            self.graph = self._osmnx.add_edge_speeds(self.graph, fallback=50)
+            self.graph = self._osmnx.add_edge_speeds(
+                self.graph, fallback=DEFAULT_SPEED_KMH
+            )
             self.graph = self._osmnx.add_edge_travel_times(self.graph)
 
             node_count = self.graph.number_of_nodes()
@@ -132,8 +137,11 @@ class SafeRouteOptimizer:
             )
             return self.graph
 
+        except (ValueError, OSError) as e:
+            logger.exception(f"Yol ağı yükleme hatası: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Yol ağı yükleme hatası: {e}")
+            logger.exception(f"Yol ağı yükleme hatası (beklenmeyen): {e}")
             return None
 
     def mark_damaged_zones(
@@ -158,7 +166,11 @@ class SafeRouteOptimizer:
             logger.error("Önce load_network() çağrılmalı.")
             return 0
 
-        buffer_radius = buffer_radius or self.config.damage_buffer_radius
+        buffer_radius = (
+            self.config.damage_buffer_radius
+            if buffer_radius is None
+            else buffer_radius
+        )
         affected_count = 0
 
         for lat, lon in damage_coords:
@@ -178,21 +190,29 @@ class SafeRouteOptimizer:
 
                 # Etkilenen kenarları işaretle
                 for u, v, key in ego_graph.edges(keys=True):
+                    if (u, v, key) in self.damaged_edges:
+                        continue  # Penaltı zaten uygulanmış
                     if self.graph.has_edge(u, v, key):
-                        # Penaltı: seyahat süresini 100x artır
-                        original_tt = self.graph[u][v][key].get(
-                            "travel_time", 60
+                        # Penaltı: seyahat süresini artır
+                        ed = self.graph[u][v][key]
+                        original_tt = ed.get(
+                            "travel_time", DEFAULT_EDGE_TRAVEL_TIME_S
                         )
-                        self.graph[u][v][key]["travel_time"] = (
-                            original_tt * 100
+                        ed["original_travel_time"] = original_tt
+                        ed["travel_time"] = (
+                            original_tt * DAMAGE_PENALTY_FACTOR
                         )
-                        self.graph[u][v][key]["damaged"] = True
+                        ed["damaged"] = True
                         self.damaged_edges.add((u, v, key))
                         affected_count += 1
 
-            except Exception as e:
+            except (KeyError, ValueError, self._nx.NetworkXError) as e:
                 logger.warning(
                     f"Hasar işaretleme hatası ({lat}, {lon}): {e}"
+                )
+            except Exception as e:
+                logger.exception(
+                    f"Hasar işaretleme hatası (beklenmeyen) ({lat}, {lon}): {e}"
                 )
 
         logger.info(

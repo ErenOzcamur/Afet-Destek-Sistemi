@@ -132,7 +132,7 @@ class AIRoadStatus:
     def label_tr(self) -> str:
         return STATUS_LABEL_TR.get(self.status, self.status)
 
-    def to_row(self) -> Dict:
+    def to_row(self) -> Dict[str, Any]:
         return {
             "ID":         self.road_id,
             "Durum":      self.label_tr,
@@ -148,7 +148,7 @@ class AIAnalysisResult:
     """Claude Vision API tam analiz sonucu."""
     mode:            str           # "single" | "before_after"
     roads:           List[AIRoadStatus] = field(default_factory=list)
-    summary:         Dict          = field(default_factory=dict)
+    summary:         Dict[str, Any] = field(default_factory=dict)
     raw_response:    str           = ""
     model_used:      str           = ""
     input_tokens:    int           = 0
@@ -310,13 +310,13 @@ class AIVisionAnalyzer:
 
     # ── İç Metodlar ─────────────────────────────────────────
 
-    def _call_api(self, messages: List[Dict]) -> Dict:
+    def _call_api(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Backend'e göre doğru API'yi çağırır."""
         if self._backend == "gemini":
             return self._call_gemini(messages)
         return self._call_anthropic(messages)
 
-    def _call_gemini(self, messages: List[Dict]) -> Dict:
+    def _call_gemini(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Google Gemini Vision API çağrısı.
 
@@ -379,7 +379,7 @@ class AIVisionAnalyzer:
             logger.error(f"Gemini API hatası ({type(exc).__name__}): {exc}")
             raise ConnectionError(f"Gemini API hatası: {exc}") from exc
 
-    def _call_anthropic(self, messages: List[Dict]) -> Dict:
+    def _call_anthropic(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Anthropic Claude API çağrısı (ücretli)."""
         try:
             import anthropic
@@ -471,11 +471,11 @@ class AIVisionAnalyzer:
             output_tokens = response.get("output_tokens", 0),
         )
 
-    def _parse_single_response(self, response: Dict) -> AIAnalysisResult:
+    def _parse_single_response(self, response: Dict[str, Any]) -> AIAnalysisResult:
         """API yanıtını AIAnalysisResult'a çevirir (tek görüntü modu)."""
         raw = response.get("content", "")
         roads: List[AIRoadStatus] = []
-        summary: Dict = {}
+        summary: Dict[str, Any] = {}
 
         try:
             # JSON bloğunu çıkar
@@ -505,11 +505,11 @@ class AIVisionAnalyzer:
 
         return self._make_result(response, "single", roads, summary, raw)
 
-    def _parse_before_after_response(self, response: Dict) -> AIAnalysisResult:
+    def _parse_before_after_response(self, response: Dict[str, Any]) -> AIAnalysisResult:
         """Before/After modu yanıt parse."""
         raw   = response.get("content", "")
         roads: List[AIRoadStatus] = []
-        summary: Dict = {}
+        summary: Dict[str, Any] = {}
 
         try:
             data    = self._extract_json(raw)
@@ -536,7 +536,7 @@ class AIVisionAnalyzer:
         return self._make_result(response, "before_after", roads, summary, raw)
 
     @staticmethod
-    def _extract_json(text: str) -> Dict:
+    def _extract_json(text: str) -> Dict[str, Any]:
         """Metin içindeki ilk JSON bloğunu çıkarır."""
         # ```json ... ``` bloğunu ara
         m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)

@@ -429,7 +429,7 @@ class SatelliteProcessor:
         """
         try:
             from rasterio.windows import Window
-            from rasterio.transform import from_bounds
+            from rasterio.windows import transform as window_transform
         except ImportError as exc:
             raise ImportError("rasterio gereklidir") from exc
 
@@ -441,8 +441,7 @@ class SatelliteProcessor:
                 window = Window(col_off, row_off, win_w, win_h)
 
                 # Tile'ın coğrafi sınırları (CRS bilgisi korunur)
-                tile_tf = rasterio.windows.transform(window, transform) \
-                    if hasattr(rasterio.windows, "transform") else transform
+                tile_tf = window_transform(window, transform)
 
                 yield window, tile_tf
 
@@ -467,34 +466,45 @@ class SatelliteProcessor:
         try:
             from skimage.metrics import structural_similarity as ssim
             import cv2
+        except ImportError as exc:
+            raise ImportError(
+                "scikit-image ve opencv gereklidir: "
+                "pip install scikit-image opencv-python-headless"
+            ) from exc
 
+        try:
             # uint8'e dönüştür (SSIM ve OpenCV için)
-            b8 = np.clip(before, 0, 255).astype(np.uint8)
-            a8 = np.clip(after,  0, 255).astype(np.uint8)
+            b8 = np.clip(before, 0, UINT8_MAX).astype(np.uint8)
+            a8 = np.clip(after,  0, UINT8_MAX).astype(np.uint8)
 
             win_size = min(self.ssim_win_size, b8.shape[0], b8.shape[1])
-            if win_size < 3:
+            if win_size < MIN_SSIM_WIN:
                 return np.zeros(b8.shape, dtype=np.uint8), 1.0, 0.0
             if win_size % 2 == 0:
                 win_size -= 1
 
             score, diff = ssim(b8, a8, win_size=win_size, full=True)
-            diff_uint8  = (np.clip((1 - diff) * 127.5, 0, 255)).astype(np.uint8)
+            diff_uint8  = (
+                np.clip((1 - diff) * SSIM_DIFF_SCALE, 0, UINT8_MAX)
+            ).astype(np.uint8)
 
             # Otsu eşikleme
             _, binary = cv2.threshold(
-                diff_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                diff_uint8, 0, UINT8_MAX,
+                cv2.THRESH_BINARY + cv2.THRESH_OTSU,
             )
 
             # Morfolojik temizlik (küçük parazitleri kaldır)
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, MORPH_KERNEL_SIZE
+            )
             binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel)
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
-            dmg_ratio = float(binary.sum() / 255) / binary.size
+            dmg_ratio = float(binary.sum() / UINT8_MAX) / binary.size
             return binary, float(score), dmg_ratio
 
-        except Exception as exc:
-            logger.debug(f"Tile tespit hatası: {exc}")
+        except (ValueError, cv2.error) as exc:
+            logger.warning(f"Tile tespit hatası: {exc}")
             empty = np.zeros(before.shape, dtype=np.uint8)
             return empty, 1.0, 0.0

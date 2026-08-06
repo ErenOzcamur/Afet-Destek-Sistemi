@@ -263,8 +263,18 @@ class DamageDetector:
 
     def _to_grayscale(self, image: np.ndarray) -> np.ndarray:
         """RGB/BGR → Grayscale dönüşümü."""
-        if len(image.shape) == 3 and image.shape[2] >= 3:
-            return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        if len(image.shape) == 3:
+            channels = image.shape[2]
+            if channels == 4:
+                return cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+            if channels == 3:
+                return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            if channels == 1:
+                return image[:, :, 0]
+            raise ValueError(
+                f"Beklenmeyen kanal sayısı: {channels}. "
+                "Görüntü RGB, RGBA veya gri tonlama olmalıdır."
+            )
         return image
 
     def _match_dimensions(
@@ -337,9 +347,12 @@ class DamageDetector:
     ) -> np.ndarray:
         """Mutlak piksel farkı haritası."""
         diff = cv2.absdiff(img1, img2)
-        # Normalize
-        if diff.max() > 0:
-            diff = (diff / diff.max() * 255).astype(np.uint8)
+        # Normalize (ara float kopyayı out parametresiyle azalt)
+        max_val = int(diff.max())
+        if max_val > 0:
+            scaled = diff.astype(np.float32)
+            np.multiply(scaled, 255.0 / max_val, out=scaled)
+            diff = scaled.astype(np.uint8)
         return diff
 
     def _create_binary_mask(
@@ -358,8 +371,8 @@ class DamageDetector:
         """
         # Ağırlıklı birleştirme
         combined = cv2.addWeighted(
-            ssim_map, 0.6,
-            diff_map, 0.4,
+            ssim_map, SSIM_WEIGHT,
+            diff_map, DIFF_WEIGHT,
             0,
         )
 
@@ -400,6 +413,8 @@ class DamageDetector:
         )
 
         regions = []
+        # Tek buffer'ı yeniden kullan (her konturda tam-çerçeve tahsisi önle)
+        mask_roi = np.zeros_like(diff_map)
         for contour in contours:
             area = cv2.contourArea(contour)
 
@@ -418,7 +433,7 @@ class DamageDetector:
             x, y, w, h = cv2.boundingRect(contour)
 
             # Severity skoru: bölgedeki ortalama fark yoğunluğu
-            mask_roi = np.zeros_like(diff_map)
+            mask_roi[:] = 0
             cv2.drawContours(mask_roi, [contour], -1, 255, -1)
             mean_intensity = cv2.mean(diff_map, mask=mask_roi)[0]
             severity_score = float(mean_intensity / 255.0)
@@ -488,8 +503,8 @@ class DamageDetector:
 
             # Alpha blending
             heatmap = cv2.addWeighted(
-                overlay_target, 0.5,
-                heatmap, 0.5,
+                overlay_target, OVERLAY_ALPHA,
+                heatmap, 1.0 - OVERLAY_ALPHA,
                 0,
             )
 
@@ -503,11 +518,8 @@ class DamageDetector:
     ) -> Dict:
         """Analiz özet istatistikleri."""
         total_pixels = reference_image.shape[0] * reference_image.shape[1]
-        damage_pixels = sum(r.area_px for r in regions)
-
-        severity_dist = {"low": 0, "mid": 0, "high": 0}
-        for r in regions:
-            severity_dist[r.severity] += 1
+        damage_pixels = _total_area(regions)
+        severity_dist = _severity_distribution(regions)
 
         return {
             "ssim_score": round(ssim_score, 4),
